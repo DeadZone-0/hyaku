@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "crates/hyaku-protocol",
+    "crates/hyaku-server",
+    "crates/hyaku-client",
+]
+resolver = "2"
