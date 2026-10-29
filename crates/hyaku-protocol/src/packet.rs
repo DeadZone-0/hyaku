@@ -12,6 +12,7 @@ pub enum ClientPacket {
     },
     Move(Direction),
     Attack(Direction),
+    ClassSkill(Direction),
     ToggleTether {
         target_id: Option<String>,
     },
@@ -28,6 +29,7 @@ pub enum ClientPacket {
         pos: Position,
     },
     AscendStairs,
+    Respawn,
     Chat {
         text: String,
     },

@@ -141,4 +141,16 @@ mod tests {
         assert!(map_a.is_walkable(map_a.spawn_pos));
         assert!(map_a.is_walkable(map_a.stairs_pos));
     }
+
+    #[test]
+    fn test_puzzle_gate_blocks_corridor() {
+        let map = FloorMap::generate(42, 3);
+        if let Some(&(_id, gate_pos)) = map.gates.first() {
+            let horiz_blocked = map.get_tile(Position::new(gate_pos.x, gate_pos.y - 1)) == Some(Tile::Wall)
+                && map.get_tile(Position::new(gate_pos.x, gate_pos.y + 1)) == Some(Tile::Wall);
+            let vert_blocked = map.get_tile(Position::new(gate_pos.x - 1, gate_pos.y)) == Some(Tile::Wall)
+                && map.get_tile(Position::new(gate_pos.x + 1, gate_pos.y)) == Some(Tile::Wall);
+            assert!(horiz_blocked || vert_blocked, "Gate at {:?} must be flanked by walls", gate_pos);
+        }
+    }
 }

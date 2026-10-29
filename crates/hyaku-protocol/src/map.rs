@@ -68,6 +68,10 @@ impl Rect {
             && self.y <= other.y + other.h
             && self.y + self.h >= other.y
     }
+
+    pub const fn contains(&self, p: Position) -> bool {
+        p.x >= self.x && p.x < self.x + self.w && p.y >= self.y && p.y < self.y + self.h
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -181,10 +185,17 @@ impl FloorMap {
         self.set_tile(shrine_pos, Tile::Shrine);
         self.shrine_pos = Some(shrine_pos);
 
-        // Gate blocking stairs until boss is dealt with
-        let gate_pos = Position::new(self.stairs_pos.x - 2, self.stairs_pos.y);
-        self.set_tile(gate_pos, Tile::Gate { id: 1, open: false });
-        self.gates.push((1, gate_pos));
+        // Wall partition sealing off the stairs alcove with a locked gate
+        let wall_x = self.stairs_pos.x - 2;
+        for y in start_y..(start_y + arena_h) {
+            let pos = Position::new(wall_x, y);
+            if y == self.stairs_pos.y {
+                self.set_tile(pos, Tile::Gate { id: 1, open: false });
+                self.gates.push((1, pos));
+            } else {
+                self.set_tile(pos, Tile::Wall);
+            }
+        }
 
         // Pressure plate in the arena
         let plate_pos = Position::new(start_x + arena_w / 2, start_y + arena_h - 3);
@@ -234,127 +245,170 @@ impl FloorMap {
     }
 
     fn generate_standard_floor(&mut self, prng: &mut Prng) {
-        let num_rooms = prng.gen_range(6, 10);
-        let mut rooms: Vec<Rect> = Vec::new();
+        let w = self.width;
+        let h = self.height;
 
-        for _ in 0..(num_rooms * 5) {
-            if rooms.len() >= num_rooms as usize {
-                break;
-            }
-            let w = prng.gen_range(8, 16);
-            let h = prng.gen_range(6, 10);
-            let x = prng.gen_range(2, self.width - w - 2);
-            let y = prng.gen_range(2, self.height - h - 2);
-            let new_room = Rect::new(x, y, w, h);
+        // 1. Define 5 purposeful chambers with deterministic spatial separation
+        // Room 0: Spawn Sanctuary (West)
+        let r0_w = prng.gen_range(10, 13);
+        let r0_h = prng.gen_range(6, 8);
+        let r0_x = prng.gen_range(3, 5);
+        let r0_y = prng.gen_range(h / 3, h / 2);
+        let room_spawn = Rect::new(r0_x, r0_y, r0_w, r0_h);
 
-            let mut overlaps = false;
-            for r in &rooms {
-                if new_room.intersects(r) {
-                    overlaps = true;
-                    break;
+        // Room 1: The Puzzle Chamber (North)
+        let r1_w = prng.gen_range(11, 14);
+        let r1_h = prng.gen_range(6, 8);
+        let r1_x = prng.gen_range(20, 25);
+        let r1_y = prng.gen_range(3, 5);
+        let room_puzzle = Rect::new(r1_x, r1_y, r1_w, r1_h);
+
+        // Room 2: The Sanctum of Renewal (South)
+        let r2_w = prng.gen_range(11, 14);
+        let r2_h = prng.gen_range(6, 8);
+        let r2_x = prng.gen_range(20, 25);
+        let r2_y = prng.gen_range((h - 11).max(18), (h - 9).max(20));
+        let room_sanctum = Rect::new(r2_x, r2_y, r2_w, r2_h);
+
+        // Room 3: Guardian Hall (East-Central)
+        let r3_w = prng.gen_range(14, 18);
+        let r3_h = prng.gen_range(8, 11);
+        let r3_x = prng.gen_range(40, 45);
+        let r3_y = prng.gen_range((h / 3 - 2).max(7), (h / 3 + 2).max(11));
+        let room_guardian = Rect::new(r3_x, r3_y, r3_w, r3_h);
+
+        // Room 4: The Ascension Vault (Far East)
+        let r4_w = prng.gen_range(9, 12);
+        let r4_h = prng.gen_range(6, 8);
+        let r4_x = prng.gen_range((w - 15).max(64), (w - 13).max(66));
+        let r4_y = prng.gen_range(h / 3, h / 2);
+        let room_stairs = Rect::new(r4_x, r4_y, r4_w, r4_h);
+
+        let rooms = [room_spawn, room_puzzle, room_sanctum, room_guardian, room_stairs];
+
+        // Carve all rooms
+        for r in &rooms {
+            for ry in r.y..(r.y + r.h) {
+                for rx in r.x..(r.x + r.w) {
+                    self.set_tile(Position::new(rx, ry), Tile::Floor);
                 }
             }
-
-            if !overlaps {
-                for ry in y..(y + h) {
-                    for rx in x..(x + w) {
-                        self.set_tile(Position::new(rx, ry), Tile::Floor);
-                    }
-                }
-                rooms.push(new_room);
-            }
         }
 
-        if rooms.is_empty() {
-            let fallback = Rect::new(4, 4, self.width - 8, self.height - 8);
-            for y in fallback.y..(fallback.y + fallback.h) {
-                for x in fallback.x..(fallback.x + fallback.w) {
-                    self.set_tile(Position::new(x, y), Tile::Floor);
-                }
-            }
-            rooms.push(fallback);
+        // 2. Carve corridors with clear topological flow
+        // Spawn -> Puzzle
+        self.carve_corridor(
+            Position::new(room_spawn.x + room_spawn.w, room_spawn.center().y),
+            Position::new(room_puzzle.center().x, room_puzzle.y + room_puzzle.h),
+        );
+        // Spawn -> Sanctum
+        self.carve_corridor(
+            Position::new(room_spawn.x + room_spawn.w, room_spawn.center().y),
+            Position::new(room_sanctum.center().x, room_sanctum.y),
+        );
+        // Puzzle -> Guardian Hall
+        self.carve_corridor(
+            Position::new(room_puzzle.x + room_puzzle.w, room_puzzle.center().y),
+            Position::new(room_guardian.x, room_guardian.y + 2),
+        );
+        // Sanctum -> Guardian Hall
+        self.carve_corridor(
+            Position::new(room_sanctum.x + room_sanctum.w, room_sanctum.center().y),
+            Position::new(room_guardian.x, room_guardian.y + room_guardian.h - 3),
+        );
+
+        // Guardian Hall -> Ascension Vault
+        let corridor_y = room_guardian.center().y;
+        let start_pos = Position::new(room_guardian.x + room_guardian.w, corridor_y);
+        let end_pos = Position::new(room_stairs.center().x, corridor_y);
+        self.carve_corridor(start_pos, end_pos);
+
+        if corridor_y != room_stairs.center().y {
+            self.carve_corridor(end_pos, room_stairs.center());
         }
 
-        // Connect adjacent rooms with corridors
-        for i in 0..(rooms.len().saturating_sub(1)) {
-            let prev = rooms[i].center();
-            let next = rooms[i + 1].center();
-            self.carve_corridor(prev, next);
-        }
+        // 3. Place Ascension Gate blocking the corridor between Guardian Hall and Stairs Vault
+        let gate_x = (start_pos.x + room_stairs.x) / 2;
+        let gate_pos = Position::new(gate_x, corridor_y);
 
-        self.spawn_pos = rooms[0].center();
-        let last_idx = rooms.len() - 1;
-        self.stairs_pos = rooms[last_idx].center();
-        self.set_tile(self.stairs_pos, Tile::StairsUp);
+        // Seal corridor above and below the gate with solid walls
+        self.set_tile(Position::new(gate_pos.x, gate_pos.y - 1), Tile::Wall);
+        self.set_tile(Position::new(gate_pos.x, gate_pos.y + 1), Tile::Wall);
+        self.set_tile(gate_pos, Tile::Gate { id: 1, open: false });
+        self.gates.push((1, gate_pos));
 
-        // Shrine in a middle room
-        if rooms.len() > 2 {
-            let shrine_idx = rooms.len() / 2;
-            let shrine_pos = rooms[shrine_idx].center();
-            if shrine_pos != self.spawn_pos && shrine_pos != self.stairs_pos {
-                self.set_tile(shrine_pos, Tile::Shrine);
-                self.shrine_pos = Some(shrine_pos);
-            }
-        }
+        // 4. Room 0 Features: Spawn point and Safe Campfire
+        self.spawn_pos = Position::new(room_spawn.x + 2, room_spawn.center().y);
+        let campfire_pos = room_spawn.center();
+        self.set_tile(campfire_pos, Tile::Campfire);
 
-        // Chasm hazard on select floors
-        if self.floor % 3 == 0 && rooms.len() >= 3 {
-            let chasm_room = &rooms[1];
-            let chasm_x = chasm_room.center().x;
-            for y in chasm_room.y..(chasm_room.y + chasm_room.h) {
-                let pos = Position::new(chasm_x, y);
+        // 5. Room 1 Features: Runic Pressure Plate (unlocks gate 1)
+        let plate_pos = room_puzzle.center();
+        self.set_tile(plate_pos, Tile::PressurePlate { id: 1, active: false });
+        self.plates.push((1, plate_pos));
+
+        // 6. Room 2 Features: Shrine of Renewal
+        let shrine_pos = room_sanctum.center();
+        self.set_tile(shrine_pos, Tile::Shrine);
+        self.shrine_pos = Some(shrine_pos);
+
+        // 7. Room 3 Features: Chasm Hazard (every 3rd floor) and Floor Guardian
+        if self.floor % 3 == 0 {
+            let chasm_x = room_guardian.center().x;
+            for cy in room_guardian.y..(room_guardian.y + room_guardian.h) {
+                let pos = Position::new(chasm_x, cy);
                 if self.get_tile(pos) == Some(Tile::Floor) {
                     self.set_tile(pos, Tile::Chasm);
                 }
             }
-            // Pre-place a bridge over one slot so players can pass without crafting
-            let bridge_pos = Position::new(chasm_x, chasm_room.center().y);
+            let bridge_pos = Position::new(chasm_x, room_guardian.center().y);
             self.set_tile(bridge_pos, Tile::Bridge);
         }
 
-        // Puzzle gates on select floors
-        if self.floor % 2 == 1 && rooms.len() >= 4 {
-            let gate_room = &rooms[rooms.len() - 2];
-            let plate_room = &rooms[1];
+        // 8. Room 4 Features: Ascension Stairs
+        self.stairs_pos = room_stairs.center();
+        self.set_tile(self.stairs_pos, Tile::StairsUp);
 
-            let gate_pos = gate_room.center();
-            let plate_pos = plate_room.center();
-
-            if gate_pos != self.stairs_pos && plate_pos != self.spawn_pos {
-                self.set_tile(gate_pos, Tile::Gate { id: 1, open: false });
-                self.gates.push((1, gate_pos));
-
-                self.set_tile(plate_pos, Tile::PressurePlate { id: 1, active: false });
-                self.plates.push((1, plate_pos));
-            }
-        }
-
-        // Populate enemies in rooms (excluding spawn room)
+        // 9. Populate Enemies with clear roles
         let mut enemy_id = 1;
         let hp_mult = 1.0 + (self.floor as f32) * 0.08;
 
-        for room in rooms.iter().skip(1) {
-            let enemy_count = prng.gen_range(1, 3);
-            for _ in 0..enemy_count {
-                let ex = prng.gen_range(room.x + 1, room.x + room.w - 2);
-                let ey = prng.gen_range(room.y + 1, room.y + room.h - 2);
-                let pos = Position::new(ex, ey);
+        // Room 1 (Puzzle): 1-2 guards defending the plate
+        let guard_pos1 = Position::new(room_puzzle.center().x - 2, room_puzzle.center().y);
+        self.initial_enemies.push(EnemyState::new(enemy_id, EnemyKind::Crawler, guard_pos1, hp_mult));
+        enemy_id += 1;
 
-                if pos != self.stairs_pos && self.is_walkable(pos) {
-                    let roll = prng.gen_range(0, 100);
-                    let kind = if roll < 40 {
-                        EnemyKind::Crawler
-                    } else if roll < 70 {
-                        EnemyKind::Archer
-                    } else if roll < 90 {
-                        EnemyKind::Brute
-                    } else {
-                        EnemyKind::Phantom
-                    };
-                    self.initial_enemies.push(EnemyState::new(enemy_id, kind, pos, hp_mult));
-                    enemy_id += 1;
-                }
-            }
+        if prng.gen_bool(50) {
+            let guard_pos2 = Position::new(room_puzzle.center().x + 2, room_puzzle.center().y);
+            self.initial_enemies.push(EnemyState::new(enemy_id, EnemyKind::Archer, guard_pos2, hp_mult));
+            enemy_id += 1;
+        }
+
+        // Room 2 (Sanctum): 1 guard defending the shrine
+        let sanctum_guard = Position::new(room_sanctum.center().x - 2, room_sanctum.center().y);
+        self.initial_enemies.push(EnemyState::new(enemy_id, EnemyKind::Phantom, sanctum_guard, hp_mult));
+        enemy_id += 1;
+
+        // Room 3 (Guardian Hall): Elite Floor Guardian (defeat unlocks the gate!)
+        let guardian_pos = Position::new(room_guardian.center().x + 2, room_guardian.center().y);
+        let mut guardian = EnemyState::new(enemy_id, EnemyKind::Brute, guardian_pos, hp_mult * 1.5);
+        guardian.is_boss = true;
+        self.initial_enemies.push(guardian);
+        enemy_id += 1;
+
+        // Guardian's escort minions
+        let escort_pos1 = Position::new(room_guardian.x + 3, room_guardian.y + 2);
+        self.initial_enemies.push(EnemyState::new(enemy_id, EnemyKind::Crawler, escort_pos1, hp_mult));
+        enemy_id += 1;
+
+        let escort_pos2 = Position::new(room_guardian.x + 3, room_guardian.y + room_guardian.h - 3);
+        self.initial_enemies.push(EnemyState::new(enemy_id, EnemyKind::Archer, escort_pos2, hp_mult));
+        enemy_id += 1;
+
+        // Room 4 (Stairs Vault): 1 final stairs guard
+        let stairs_guard_pos = Position::new(room_stairs.x + 2, room_stairs.center().y);
+        if stairs_guard_pos != self.stairs_pos {
+            self.initial_enemies.push(EnemyState::new(enemy_id, EnemyKind::Phantom, stairs_guard_pos, hp_mult));
         }
     }
 

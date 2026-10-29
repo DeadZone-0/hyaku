@@ -1,3 +1,5 @@
 /target
+/tmp/hyaku_target
+.cargo/
 **/*.rs.bk
 Cargo.lock
