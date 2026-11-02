@@ -1,9 +1,10 @@
 use crossterm::event::KeyCode;
 use hyaku_protocol::{
-    get_class_preset, ClientPacket, Direction, FloorMap, PlayerState, Position, ServerPacket,
-    TickState, PLAYER_CLASSES,
+    get_class_preset, ClientPacket, Direction, FloorCarving, FloorMap, PlayerState, Position,
+    ServerPacket, TickState, PLAYER_CLASSES,
 };
 use ratatui::style::Color;
+use std::collections::HashMap;
 
 // TODO(ZE): Customize HYAKU (百) multi-line ASCII title logo, class preview ASCII art, and title screen theme colors
 pub const TITLE_BANNER: &str = r#"
@@ -84,6 +85,12 @@ pub struct FloatingText {
     pub ttl: u8,
 }
 
+#[derive(Debug, Clone)]
+pub struct SpeechBubble {
+    pub text: String,
+    pub ttl: u16,
+}
+
 pub struct AppState {
     pub screen: Screen,
     pub input_mode: InputMode,
@@ -98,6 +105,7 @@ pub struct AppState {
     pub chat_input: String,
     pub carving_input: String,
     pub chat_log: Vec<(String, String)>,
+    pub speech_bubbles: HashMap<String, SpeechBubble>,
     pub announcement: Option<String>,
     pub combat_log: Vec<String>,
     pub floating_texts: Vec<FloatingText>,
@@ -126,6 +134,7 @@ impl AppState {
             chat_input: String::new(),
             carving_input: String::new(),
             chat_log: Vec::new(),
+            speech_bubbles: HashMap::new(),
             announcement: None,
             combat_log: Vec::new(),
             floating_texts: Vec::new(),
@@ -167,6 +176,15 @@ impl AppState {
                 false
             }
         });
+
+        self.speech_bubbles.retain(|_, bubble| {
+            if bubble.ttl > 1 {
+                bubble.ttl -= 1;
+                true
+            } else {
+                false
+            }
+        });
     }
 
     pub fn spawn_floating_text(&mut self, pos: Position, text: String, color: Color) {
@@ -182,6 +200,14 @@ impl AppState {
         let id = self.my_player_id.as_ref()?;
         let tick = self.tick_state.as_ref()?;
         tick.players.iter().find(|p| &p.id == id)
+    }
+
+    pub fn nearby_carving(&self) -> Option<&FloorCarving> {
+        let me = self.my_player()?;
+        let tick = self.tick_state.as_ref()?;
+        tick.carvings
+            .iter()
+            .find(|c| c.pos == me.pos || me.pos.manhattan_distance(c.pos) <= 2)
     }
 
     pub fn update_camera(&mut self, viewport_w: i32, viewport_h: i32) {
@@ -308,6 +334,13 @@ impl AppState {
                 KeyCode::Enter => {
                     let text = self.chat_input.trim().to_string();
                     if !text.is_empty() {
+                        self.speech_bubbles.insert(
+                            self.username.clone(),
+                            SpeechBubble {
+                                text: text.clone(),
+                                ttl: 210, // ~3.5s at 60 FPS
+                            },
+                        );
                         self.queue_packet(ClientPacket::Chat { text });
                         self.chat_input.clear();
                     }
@@ -373,11 +406,32 @@ impl AppState {
             KeyCode::Char('f') => {
                 self.input_mode = InputMode::CarvingMessage;
             }
-            KeyCode::Char('u') => {
-                if let (Some(me), Some(tick)) = (self.my_player(), &self.tick_state) {
-                    if let Some(carving) = tick.carvings.iter().find(|c| c.pos == me.pos || me.pos.manhattan_distance(c.pos) <= 1) {
-                        self.queue_packet(ClientPacket::UpvoteCarving { pos: carving.pos });
-                    }
+            KeyCode::Char('u') | KeyCode::Char('U') => {
+                let target_carving = if let (Some(me), Some(tick)) = (self.my_player(), &self.tick_state) {
+                    tick.carvings
+                        .iter()
+                        .find(|c| c.pos == me.pos || me.pos.manhattan_distance(c.pos) <= 2)
+                        .map(|c| (me.pos, c.pos, c.author.clone(), c.message.clone()))
+                } else {
+                    None
+                };
+
+                if let Some((my_pos, c_pos, author, message)) = target_carving {
+                    self.spawn_floating_text(
+                        my_pos,
+                        "* APPRAISED +1 *".to_string(),
+                        Color::Yellow,
+                    );
+                    self.announcement = Some(format!(
+                        "Appraised message by @{}: \"{}\"",
+                        author, message
+                    ));
+                    self.queue_packet(ClientPacket::UpvoteCarving { pos: c_pos });
+                } else {
+                    self.announcement = Some(
+                        "No runestone carving nearby to read/upvote (stand within 2 steps of '?')"
+                            .to_string(),
+                    );
                 }
             }
             KeyCode::Up | KeyCode::Char('w') | KeyCode::Char('k') => {
@@ -494,6 +548,13 @@ impl AppState {
                 text,
                 ..
             } => {
+                self.speech_bubbles.insert(
+                    sender.clone(),
+                    SpeechBubble {
+                        text: text.clone(),
+                        ttl: 210, // ~3.5s at 60 FPS
+                    },
+                );
                 self.chat_log.push((sender, text));
                 if self.chat_log.len() > 50 {
                     self.chat_log.remove(0);
@@ -612,5 +673,77 @@ mod tests {
 
         let screen_pos = app.world_to_screen(Position::new(40, 15));
         assert_eq!(screen_pos, (20, 10)); // Exactly in the middle of 40x20
+    }
+
+    #[test]
+    fn test_speech_bubble_ttl_expiration() {
+        let mut app = AppState::new(
+            "ZeHero".to_string(),
+            "ws://127.0.0.1:3000/ws".to_string(),
+            0,
+        );
+
+        app.handle_server_packet(ServerPacket::ChatMessage {
+            sender: "ZeHero".to_string(),
+            text: "sup".to_string(),
+            timestamp: 100,
+        });
+
+        assert!(app.speech_bubbles.contains_key("ZeHero"));
+        assert_eq!(app.speech_bubbles.get("ZeHero").unwrap().text, "sup");
+
+        // Tick effects forward until TTL expires
+        for _ in 0..220 {
+            app.tick_effects();
+        }
+
+        // Bubble should be completely expired and removed
+        assert!(!app.speech_bubbles.contains_key("ZeHero"));
+    }
+
+    #[test]
+    fn test_nearby_carving_detection_and_appraisal() {
+        let mut app = AppState::new(
+            "ZeHero".to_string(),
+            "ws://127.0.0.1:3000/ws".to_string(),
+            0,
+        );
+        app.screen = Screen::Connected;
+        app.my_player_id = Some("p-1".to_string());
+        app.tick_state = Some(TickState {
+            tick: 1,
+            floor: 1,
+            players: vec![PlayerState::new(
+                "p-1".to_string(),
+                "ZeHero".to_string(),
+                0,
+                Position::new(10, 10),
+                1,
+            )],
+            enemies: Vec::new(),
+            projectiles: Vec::new(),
+            tiles_override: Vec::new(),
+            carvings: vec![FloorCarving::new(
+                Position::new(11, 10),
+                "Aria".to_string(),
+                "Watch out for traps!".to_string(),
+            )],
+            tower_shards_bank: 0,
+        });
+
+        // Standing 1 step away -> carving is detected
+        let carving = app.nearby_carving();
+        assert!(carving.is_some());
+        assert_eq!(carving.unwrap().author, "Aria");
+
+        // Press 'U' to upvote
+        app.handle_key(KeyCode::Char('u'));
+        assert_eq!(app.outbound_queue.len(), 1);
+        match &app.outbound_queue[0] {
+            ClientPacket::UpvoteCarving { pos } => {
+                assert_eq!(*pos, Position::new(11, 10));
+            }
+            other => panic!("expected UpvoteCarving, got {:?}", other),
+        }
     }
 }
