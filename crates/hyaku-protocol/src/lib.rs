@@ -8,7 +8,7 @@ pub mod tile;
 
 pub use direction::Direction;
 pub use entity::{
-    get_class_preset, EnemyKind, EnemyState, FloorCarving, PlayerClassPreset, PlayerState,
+    get_class_preset, DecoyState, EnemyKind, EnemyState, FloorCarving, PlayerClassPreset, PlayerState,
     ProjectileState, PLAYER_CLASSES,
 };
 pub use map::{FloorMap, Rect};
@@ -59,6 +59,11 @@ mod tests {
 
         assert_eq!(p1.direction_to(Position::new(10, 4)), Some(Direction::Right));
         assert_eq!(p1.direction_to(Position::new(3, 1)), Some(Direction::Up));
+
+        let line = Position::new(0, 0).line_to(Position::new(3, 0));
+        assert_eq!(line.len(), 4);
+        assert_eq!(line[0], Position::new(0, 0));
+        assert_eq!(line[3], Position::new(3, 0));
     }
 
     #[test]
@@ -125,6 +130,10 @@ mod tests {
                 "Praise the shrine!".to_string(),
             )],
             tower_shards_bank: 15,
+            decoys: vec![DecoyState::new(1, "Alice".to_string(), Position::new(5, 5), 300)],
+            shrine_shards: 10,
+            shrine_goal: 50,
+            stairs_unlocked: false,
         };
 
         let server_packet = ServerPacket::Tick(tick_state.clone());

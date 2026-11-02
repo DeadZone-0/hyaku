@@ -1,5 +1,5 @@
 use crate::app::{
-    AppState, InputMode, Screen, CLASS_PREVIEWS, DEATH_BANNER, DEATH_COLOR_ACCENT,
+    AppState, InputMode, Screen, ServerBannerData, CLASS_PREVIEWS, DEATH_BANNER, DEATH_COLOR_ACCENT,
     DEATH_COLOR_PRIMARY, TITLE_BANNER, TITLE_COLOR_ACCENT, TITLE_COLOR_MUTED, TITLE_COLOR_PRIMARY,
 };
 use hyaku_protocol::{Direction, Position, Tile, PLAYER_CLASSES};
@@ -456,6 +456,11 @@ fn render_game_screen(frame: &mut Frame, app: &mut AppState) {
     if app.my_player().map_or(false, |p| !p.is_alive()) {
         render_death_screen(frame, area);
     }
+
+    // Full-width ServerBanner popup overlay across all connected terminals
+    if let Some(ref banner) = app.server_banner {
+        render_server_banner(frame, banner, area);
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -463,7 +468,6 @@ fn render_game_screen(frame: &mut Frame, app: &mut AppState) {
 // -------------------------------------------------------------------------
 fn render_top_status_bar(frame: &mut Frame, app: &AppState, area: Rect) {
     let palette = get_stratum_palette(app.current_floor.clamp(1, 100) as u8);
-    let my_shards = app.my_player().map(|p| p.shards).unwrap_or(0);
     let tower_bank = app
         .tick_state
         .as_ref()
@@ -475,9 +479,17 @@ fn render_top_status_bar(frame: &mut Frame, app: &AppState, area: Rect) {
         .map(|t| t.players.len())
         .unwrap_or(0);
 
-    let shard_goal = 50.max(app.current_floor * 5);
-    let total_shards = (my_shards + tower_bank).min(shard_goal);
-    let shard_ratio = (total_shards as f64 / shard_goal as f64).clamp(0.0, 1.0);
+    let (shrine_cur, shrine_goal, stairs_unlocked) = if let Some(tick) = &app.tick_state {
+        (tick.shrine_shards, tick.shrine_goal, tick.stairs_unlocked)
+    } else {
+        (0, 0, true)
+    };
+
+    let shard_ratio = if shrine_goal == 0 {
+        1.0
+    } else {
+        (shrine_cur as f64 / shrine_goal as f64).clamp(0.0, 1.0)
+    };
 
     let (stairs_compass, stairs_dist) =
         if let (Some(me), Some(map)) = (app.my_player(), &app.current_map) {
@@ -560,14 +572,15 @@ fn render_top_status_bar(frame: &mut Frame, app: &AppState, area: Rect) {
     frame.render_widget(Paragraph::new(floor_line), cols[0]);
 
     // Middle: Shrine [百] Shard Progress Gauge
-    let gauge_label = format!(
-        "Shrine [百]: {}/{} Shards (Bank: {})",
-        total_shards, shard_goal, tower_bank
-    );
+    let gauge_label = if shrine_goal == 0 || stairs_unlocked {
+        format!("Shrine [百]: UNLOCKED ({}/{} Shards)", shrine_cur, shrine_goal)
+    } else {
+        format!("Shrine [百]: {}/{} Shards (Bank: {})", shrine_cur, shrine_goal, tower_bank)
+    };
     let shrine_gauge = Gauge::default()
         .gauge_style(
             Style::default()
-                .fg(palette.accent_color)
+                .fg(if stairs_unlocked { Color::Rgb(80, 255, 160) } else { palette.accent_color })
                 .bg(Color::Rgb(25, 30, 45))
                 .add_modifier(Modifier::BOLD),
         )
@@ -587,6 +600,20 @@ fn render_top_status_bar(frame: &mut Frame, app: &AppState, area: Rect) {
             Span::styled(
                 "[SEALED] ",
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(
+                "[OPEN] ",
+                Style::default()
+                    .fg(Color::Rgb(80, 255, 160))
+                    .add_modifier(Modifier::BOLD),
+            )
+        },
+        Span::raw("Stairs: "),
+        if !stairs_unlocked {
+            Span::styled(
+                "[SEALED] ",
+                Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD),
             )
         } else {
             Span::styled(
@@ -794,13 +821,42 @@ fn render_camera_viewport(frame: &mut Frame, app: &mut AppState, area: Rect) {
                         for (idx, ch) in preview.chars().enumerate() {
                             let cur_x = p_start_x + idx as i32;
                             if cur_x >= 0 && cur_x < inner_w {
-                                grid[p_y as usize][cur_x as usize] = (
-                                    ch,
-                                    Style::default()
-                                        .fg(Color::Rgb(255, 240, 150))
-                                        .bg(Color::Rgb(40, 30, 10))
-                                        .add_modifier(Modifier::BOLD),
+                                let target_world_pos = Position::new(
+                                    cur_x + app.camera_offset.0,
+                                    p_y + app.camera_offset.1,
                                 );
+                                let tile_is_interactive = app.current_map.as_ref().map_or(false, |m| {
+                                    m.get_tile(target_world_pos).map_or(false, |t| {
+                                        matches!(
+                                            t,
+                                            Tile::PressurePlate { .. }
+                                                | Tile::Gate { .. }
+                                                | Tile::Shrine
+                                                | Tile::Campfire
+                                                | Tile::StairsUp
+                                        )
+                                    })
+                                }) || tick.tiles_override.iter().any(|(p, t)| {
+                                    *p == target_world_pos
+                                        && matches!(
+                                            t,
+                                            Tile::PressurePlate { .. }
+                                                | Tile::Gate { .. }
+                                                | Tile::Shrine
+                                                | Tile::Campfire
+                                                | Tile::StairsUp
+                                        )
+                                });
+
+                                if !tile_is_interactive {
+                                    grid[p_y as usize][cur_x as usize] = (
+                                        ch,
+                                        Style::default()
+                                            .fg(Color::Rgb(255, 240, 150))
+                                            .bg(Color::Rgb(40, 30, 10))
+                                            .add_modifier(Modifier::BOLD),
+                                    );
+                                }
                             }
                         }
                     }
@@ -826,6 +882,45 @@ fn render_camera_viewport(frame: &mut Frame, app: &mut AppState, area: Rect) {
                     .bg(Color::Rgb(bg_rgb.0, bg_rgb.1, bg_rgb.2))
                     .add_modifier(Modifier::BOLD);
                 grid[sy as usize][sx as usize] = (proj.glyph, style);
+            }
+        }
+
+        // 4.5. Render active Holo-Decoys (holding pressure plates, distracting enemies)
+        for decoy in &tick.decoys {
+            let (sx, sy) = app.world_to_screen(decoy.pos);
+            if sx >= 0 && sx < inner_w && sy >= 0 && sy < inner_h {
+                let remaining_secs = (decoy.remaining_ticks + 19) / 20;
+                let pulse_fg = if (tick_counter / 2) % 2 == 0 {
+                    Color::Rgb(100, 240, 255)
+                } else {
+                    Color::Rgb(60, 180, 255)
+                };
+                let style = Style::default()
+                    .fg(pulse_fg)
+                    .bg(Color::Rgb(15, 35, 60))
+                    .add_modifier(Modifier::BOLD);
+                grid[sy as usize][sx as usize] = ('§', style);
+
+                // Overhead Holo label
+                let tag = format!("~HOLO {}s~", remaining_secs);
+                let tag_len = tag.chars().count() as i32;
+                let tag_start_x = (sx - tag_len / 2).max(0);
+                let tag_y = sy - 1;
+
+                if tag_y >= 0 && tag_y < inner_h {
+                    for (idx, ch) in tag.chars().enumerate() {
+                        let cur_x = tag_start_x + idx as i32;
+                        if cur_x >= 0 && cur_x < inner_w {
+                            grid[tag_y as usize][cur_x as usize] = (
+                                ch,
+                                Style::default()
+                                    .fg(Color::Rgb(120, 230, 255))
+                                    .bg(Color::Rgb(10, 25, 45))
+                                    .add_modifier(Modifier::BOLD),
+                            );
+                        }
+                    }
+                }
             }
         }
 
@@ -861,6 +956,49 @@ fn render_camera_viewport(frame: &mut Frame, app: &mut AppState, area: Rect) {
             }
         }
 
+        // 5b. Render Lightning Tethers connecting tethered teammates
+        let mut rendered_tethers: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+        for p in &tick.players {
+            if let Some(ref target_id) = p.tether_target {
+                let pair_key = if p.id < *target_id {
+                    (p.id.clone(), target_id.clone())
+                } else {
+                    (target_id.clone(), p.id.clone())
+                };
+
+                if rendered_tethers.contains(&pair_key) {
+                    continue;
+                }
+                rendered_tethers.insert(pair_key);
+
+                if let Some(target) = tick.players.iter().find(|t| t.id == *target_id) {
+                    if p.is_alive() && target.is_alive() {
+                        let line_points = p.pos.line_to(target.pos);
+                        for (idx, pt) in line_points.iter().enumerate() {
+                            if *pt == p.pos || *pt == target.pos {
+                                continue;
+                            }
+                            let (sx, sy) = app.world_to_screen(*pt);
+                            if sx >= 0 && sx < inner_w && sy >= 0 && sy < inner_h {
+                                let spark_glyph = match (tick_counter + idx as u64) % 3 {
+                                    0 => '⚡',
+                                    1 => '⠶',
+                                    _ => '~',
+                                };
+                                grid[sy as usize][sx as usize] = (
+                                    spark_glyph,
+                                    Style::default()
+                                        .fg(Color::Rgb(120, 240, 255))
+                                        .bg(Color::Rgb(15, 35, 55))
+                                        .add_modifier(Modifier::BOLD),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // 6. Render other players & local player with @username tags and temporary speech bubbles
         for player in &tick.players {
             let (sx, sy) = app.world_to_screen(player.pos);
@@ -874,6 +1012,26 @@ fn render_camera_viewport(frame: &mut Frame, app: &mut AppState, area: Rect) {
                             .bg(Color::Rgb(50, 15, 15))
                             .add_modifier(Modifier::BOLD),
                     );
+                    if !is_me && sy > 0 {
+                        let revive_tag = format!("[E: Revive @{}]", player.username);
+                        let r_len = revive_tag.chars().count() as i32;
+                        let r_start_x = (sx - r_len / 2).max(0);
+                        let r_y = sy - 1;
+                        if r_y >= 0 && r_y < inner_h {
+                            for (idx, ch) in revive_tag.chars().enumerate() {
+                                let cur_x = r_start_x + idx as i32;
+                                if cur_x >= 0 && cur_x < inner_w {
+                                    grid[r_y as usize][cur_x as usize] = (
+                                        ch,
+                                        Style::default()
+                                            .fg(Color::Rgb(120, 255, 160))
+                                            .bg(Color::Rgb(20, 40, 20))
+                                            .add_modifier(Modifier::BOLD),
+                                    );
+                                }
+                            }
+                        }
+                    }
                     continue;
                 }
 
@@ -1248,9 +1406,9 @@ fn tile_to_glyph_and_style(
             )
         }
         Tile::Bridge => (
-            '=',
+            '═',
             Style::default()
-                .fg(Color::Rgb(220, 160, 85))
+                .fg(Color::Rgb(240, 185, 95))
                 .bg(Color::Rgb(55, 35, 20))
                 .add_modifier(Modifier::BOLD),
         ),
@@ -1330,7 +1488,7 @@ fn render_radar_minimap(frame: &mut Frame, app: &AppState, area: Rect) {
                         Tile::Wall => ('#', Style::default().fg(Color::DarkGray)),
                         Tile::Floor => ('·', Style::default().fg(Color::Rgb(40, 48, 65))),
                         Tile::Chasm => (' ', Style::default().bg(Color::Black)),
-                        Tile::Bridge => ('=', Style::default().fg(Color::Rgb(180, 120, 60))),
+                        Tile::Bridge => ('═', Style::default().fg(Color::Rgb(180, 120, 60))),
                         Tile::Shrine => (
                             '百',
                             Style::default()
@@ -1403,6 +1561,20 @@ fn render_radar_minimap(frame: &mut Frame, app: &AppState, area: Rect) {
                     '•',
                     Style::default()
                         .fg(col)
+                        .add_modifier(Modifier::BOLD),
+                );
+            }
+        }
+
+        // 3.5. Plot active Holo-Decoys ('§') on radar
+        for decoy in &tick.decoys {
+            let rx = ((decoy.pos.x as f32 / map_w as f32) * rw as f32) as usize;
+            let ry = ((decoy.pos.y as f32 / map_h as f32) * rh as f32) as usize;
+            if rx < rw && ry < rh {
+                radar_grid[ry][rx] = (
+                    '§',
+                    Style::default()
+                        .fg(Color::Rgb(100, 230, 255))
                         .add_modifier(Modifier::BOLD),
                 );
             }
@@ -1695,13 +1867,19 @@ fn render_bottom_hud(frame: &mut Frame, app: &AppState, area: Rect) {
         Span::raw(" Strike | "),
         Span::styled("[Q]", Style::default().fg(Color::Cyan)),
         Span::raw(" Power | "),
-        Span::styled("[E]", Style::default().fg(Color::Green)),
-        Span::raw(" Ascend | "),
+        Span::styled("[R]", Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD)),
+        Span::raw(" Decoy | "),
+        Span::styled("[T]", Style::default().fg(Color::Rgb(120, 240, 255)).add_modifier(Modifier::BOLD)),
+        Span::raw(" Tether ⚡ | "),
+        Span::styled("[B]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::raw(" Bridge (5S) | "),
+        Span::styled("[E]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        Span::raw(" Revive/Shrine/Ascend | "),
     ];
 
     if app.nearby_carving().is_some() {
         hint_spans.push(Span::styled(
-            "[U] Upvote Runestone | ",
+            "[U] Runestone | ",
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         ));
     }
@@ -1709,14 +1887,8 @@ fn render_bottom_hud(frame: &mut Frame, app: &AppState, area: Rect) {
     hint_spans.extend(vec![
         Span::styled("[1-4]", Style::default().fg(Color::Rgb(80, 240, 255))),
         Span::raw(" Callouts | "),
-        Span::styled("[B]", Style::default().fg(Color::Yellow)),
-        Span::raw(" Bridge | "),
         Span::styled("[C]", Style::default().fg(Color::Rgb(255, 140, 40))),
         Span::raw(" Rest | "),
-        Span::styled("[X]", Style::default().fg(Color::LightCyan)),
-        Span::raw(" Decoy | "),
-        Span::styled("[Z]", Style::default().fg(Color::Yellow)),
-        Span::raw(" Deposit | "),
         Span::styled("[Enter]", Style::default().fg(Color::White)),
         Span::raw(" Chat | "),
         Span::styled("[F]", Style::default().fg(Color::LightYellow)),
@@ -1797,4 +1969,51 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+fn render_server_banner(frame: &mut Frame, banner: &ServerBannerData, area: Rect) {
+    let banner_h = 7u16;
+    let banner_y = (area.height.saturating_sub(banner_h)) / 3;
+    let banner_area = Rect::new(area.x, area.y + banner_y, area.width, banner_h.min(area.height));
+
+    frame.render_widget(Clear, banner_area);
+
+    let border_color = Color::Rgb(255, 215, 0); // Radiant Gold
+    let banner_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color).add_modifier(Modifier::BOLD))
+        .title(" ★ TOWER CO-OP ANNOUNCEMENT ★ ")
+        .title_alignment(Alignment::Center);
+
+    let inner = banner_block.inner(banner_area);
+    frame.render_widget(banner_block, banner_area);
+
+    if inner.height < 3 || inner.width < 10 {
+        return;
+    }
+
+    let text = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            banner.title.clone(),
+            Style::default()
+                .fg(Color::Rgb(80, 240, 255))
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            banner.message.clone(),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![
+            Span::styled(
+                "  [ Stand on Ascension Stairs [▲] and press [E] to Ascend! ]  ",
+                Style::default()
+                    .fg(Color::Rgb(80, 255, 160))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+    ];
+
+    let p = Paragraph::new(text).alignment(Alignment::Center);
+    frame.render_widget(p, inner);
 }

@@ -29,12 +29,16 @@ pub async fn run_tick_loop(state: Arc<RwLock<ServerState>>) {
         for &floor_num in &active_floors {
             let floor_inst = server.get_or_create_floor(floor_num);
             let tick_state = floor_inst.step_tick(tower_shards);
-            floor_ticks.push((floor_num, tick_state));
+            let announcements = floor_inst.drain_announcements();
+            floor_ticks.push((floor_num, tick_state, announcements));
         }
 
-        // Broadcast Tick packets to respective floors
-        for (floor_num, tick_state) in floor_ticks {
+        // Broadcast Tick packets and unseal announcements to respective floors
+        for (floor_num, tick_state, announcements) in floor_ticks {
             server.broadcast_to_floor(floor_num, ServerPacket::Tick(tick_state));
+            for announcement in announcements {
+                server.broadcast_to_floor(floor_num, ServerPacket::Announcement { text: announcement });
+            }
         }
     }
 }

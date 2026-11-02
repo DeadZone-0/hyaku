@@ -89,6 +89,33 @@ impl Position {
             Some(Direction::Up)
         }
     }
+
+    /// Computes all integer grid points along the line segment between two positions
+    /// using Bresenham's integer line algorithm (for lightning tethers, piercing arrows, beam effects).
+    pub fn line_to(&self, other: Position) -> Vec<Position> {
+        let mut points = Vec::new();
+        let dx = (other.x - self.x).abs();
+        let dy = (other.y - self.y).abs();
+        let sx = if self.x < other.x { 1 } else { -1 };
+        let sy = if self.y < other.y { 1 } else { -1 };
+        let mut err = dx - dy;
+
+        let mut cur = *self;
+        while cur != other {
+            points.push(cur);
+            let e2 = 2 * err;
+            if e2 > -dy {
+                err -= dy;
+                cur.x += sx;
+            }
+            if e2 < dx {
+                err += dx;
+                cur.y += sy;
+            }
+        }
+        points.push(other);
+        points
+    }
 }
 
 impl Add for Position {

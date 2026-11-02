@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 hyaku-protocol = { path = "../hyaku-protocol" }
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = { version = "0.26", features = ["connect"] }
+tokio-tungstenite = { version = "0.26", features = ["connect", "rustls-tls-webpki-roots"] }
 ratatui = "0.30"
 crossterm = { version = "0.28", features = ["event-stream"] }
 serde = { version = "1.0", features = ["derive"] }

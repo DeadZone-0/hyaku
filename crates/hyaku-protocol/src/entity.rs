@@ -229,6 +229,25 @@ impl ProjectileState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecoyState {
+    pub id: u64,
+    pub owner_name: String,
+    pub pos: Position,
+    pub remaining_ticks: u32,
+}
+
+impl DecoyState {
+    pub fn new(id: u64, owner_name: String, pos: Position, remaining_ticks: u32) -> Self {
+        Self {
+            id,
+            owner_name,
+            pos,
+            remaining_ticks,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FloorCarving {
     pub pos: Position,
     pub author: String,

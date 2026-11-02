@@ -1,0 +1,158 @@
+name: Hyaku Multi-Platform Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            use_cross: false
+            archive_suffix: tar.gz
+          - os: macos-13
+            target: x86_64-apple-darwin
+            use_cross: false
+            archive_suffix: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            use_cross: false
+            archive_suffix: tar.gz
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux dependencies (musl)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Build Hyaku Release Binaries
+        run: |
+          cargo build --release --target ${{ matrix.target }} --workspace
+
+      - name: Prepare Artifact Package
+        id: package
+        shell: bash
+        run: |
+          PKG_NAME="hyaku-${{ matrix.target }}"
+          STAGE_DIR="release_stage/${PKG_NAME}"
+          mkdir -p "${STAGE_DIR}"
+
+          BIN_EXT=""
+          if [[ "${{ matrix.target }}" == *"windows"* ]]; then
+            BIN_EXT=".exe"
+          fi
+
+          TARGET_DIR="target/${{ matrix.target }}/release"
+
+          # Copy client (renamed to hyaku)
+          cp "${TARGET_DIR}/hyaku-client${BIN_EXT}" "${STAGE_DIR}/hyaku${BIN_EXT}"
+
+          # Copy server if built
+          if [ -f "${TARGET_DIR}/hyaku-server${BIN_EXT}" ]; then
+            cp "${TARGET_DIR}/hyaku-server${BIN_EXT}" "${STAGE_DIR}/hyaku-server${BIN_EXT}"
+          fi
+
+          # Copy docs & installer
+          cp README.md "${STAGE_DIR}/" || true
+          cp install.sh "${STAGE_DIR}/" || true
+
+          # Strip binaries on unix
+          if [[ "${{ matrix.target }}" != *"windows"* ]]; then
+            strip "${STAGE_DIR}/hyaku" 2>/dev/null || true
+            if [ -f "${STAGE_DIR}/hyaku-server" ]; then
+              strip "${STAGE_DIR}/hyaku-server" 2>/dev/null || true
+            fi
+          fi
+
+          # Create tar.gz archive
+          ARCHIVE="${PKG_NAME}.${{ matrix.archive_suffix }}"
+          tar -czf "${ARCHIVE}" -C release_stage "${PKG_NAME}"
+          sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+
+          # Also create standalone hyaku-server archive for linux
+          if [ -f "${STAGE_DIR}/hyaku-server" ]; then
+            SERVER_PKG="hyaku-server-${{ matrix.target }}"
+            mkdir -p "release_stage/${SERVER_PKG}"
+            cp "${STAGE_DIR}/hyaku-server" "release_stage/${SERVER_PKG}/"
+            tar -czf "${SERVER_PKG}.tar.gz" -C release_stage "${SERVER_PKG}"
+            sha256sum "${SERVER_PKG}.tar.gz" > "${SERVER_PKG}.tar.gz.sha256"
+          fi
+
+          echo "archive=${ARCHIVE}" >> $GITHUB_OUTPUT
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: hyaku-build-${{ matrix.target }}
+          path: |
+            hyaku-*.tar.gz
+            hyaku-*.sha256
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: downloaded_artifacts
+
+      - name: Consolidate Release Assets
+        id: prep
+        shell: bash
+        run: |
+          mkdir -p release_assets
+          find downloaded_artifacts -type f \( -name "*.tar.gz" -o -name "*.sha256" \) -exec cp {} release_assets/ \;
+
+          cd release_assets
+          cat *.sha256 > SHA256SUMS.txt || true
+          cd ..
+
+          IS_TAG=false
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            IS_TAG=true
+            TAG_NAME="${{ github.ref_name }}"
+          else
+            TAG_NAME="latest"
+          fi
+
+          echo "is_tag=${IS_TAG}" >> $GITHUB_OUTPUT
+          echo "tag_name=${TAG_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Publish Release (Rolling 'latest' or Tagged)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.prep.outputs.tag_name }}
+          name: ${{ steps.prep.outputs.is_tag == 'true' && format('Hyaku {0}', steps.prep.outputs.tag_name) || 'Hyaku Rolling Release (Latest)' }}
+          prerelease: ${{ steps.prep.outputs.is_tag != 'true' }}
+          draft: false
+          generate_release_notes: true
+          files: release_assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

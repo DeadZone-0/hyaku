@@ -91,6 +91,13 @@ pub struct SpeechBubble {
     pub ttl: u16,
 }
 
+#[derive(Debug, Clone)]
+pub struct ServerBannerData {
+    pub title: String,
+    pub message: String,
+    pub ttl: u16,
+}
+
 pub struct AppState {
     pub screen: Screen,
     pub input_mode: InputMode,
@@ -115,6 +122,7 @@ pub struct AppState {
     pub should_quit: bool,
     pub title_edit_name: bool,
     pub last_dir: Direction,
+    pub server_banner: Option<ServerBannerData>,
 }
 
 impl AppState {
@@ -144,6 +152,7 @@ impl AppState {
             should_quit: false,
             title_edit_name: false,
             last_dir: Direction::Down,
+            server_banner: None,
         }
     }
 
@@ -185,6 +194,14 @@ impl AppState {
                 false
             }
         });
+
+        if let Some(ref mut banner) = self.server_banner {
+            if banner.ttl > 1 {
+                banner.ttl -= 1;
+            } else {
+                self.server_banner = None;
+            }
+        }
     }
 
     pub fn spawn_floating_text(&mut self, pos: Position, text: String, color: Color) {
@@ -524,51 +541,216 @@ impl AppState {
                 self.announcement = Some(format!("Striking with {} towards {}", action_desc, self.last_dir));
                 self.queue_packet(ClientPacket::Attack(self.last_dir));
             }
-            KeyCode::Char('e') => {
-                let is_gate_locked = self.current_map.as_ref().map_or(false, |map| {
-                    if map.gates.is_empty() {
-                        return false;
+            KeyCode::Char('r') | KeyCode::Char('R') | KeyCode::Char('x') => {
+                let player_mana = self.my_player().map(|p| (p.pos, p.mana));
+                if let Some((pos, mana)) = player_mana {
+                    if mana >= 20 {
+                        self.spawn_floating_text(
+                            pos,
+                            "* HOLO-DECOY § *".to_string(),
+                            Color::Rgb(100, 230, 255),
+                        );
+                        self.announcement = Some("Projecting Holo-Decoy (15s, -20 MP)...".to_string());
                     }
-                    map.gates.iter().any(|&(_id, gpos)| {
-                        if let Some(tick) = &self.tick_state {
-                            if let Some(&(_, hyaku_protocol::Tile::Gate { open, .. })) =
-                                tick.tiles_override.iter().find(|(p, _)| *p == gpos)
-                            {
-                                return !open;
-                            }
-                        }
-                        true
-                    })
-                });
+                }
+                self.queue_packet(ClientPacket::DeployDecoy);
+            }
+            KeyCode::Char('t') | KeyCode::Char('T') => {
+                let (target_opt, is_already_tethered) = if let (Some(me), Some(tick)) = (self.my_player(), &self.tick_state) {
+                    let cur_tether = me.tether_target.clone();
+                    if cur_tether.is_some() {
+                        (cur_tether, true)
+                    } else {
+                        // Find closest alive teammate within range 14
+                        let closest = tick.players
+                            .iter()
+                            .filter(|p| p.id != me.id && p.is_alive())
+                            .min_by_key(|p| me.pos.manhattan_distance(p.pos))
+                            .map(|p| (p.id.clone(), p.username.clone(), p.pos));
+                        (closest.map(|(id, _, _)| id), false)
+                    }
+                } else {
+                    (None, false)
+                };
 
-                if is_gate_locked {
+                if is_already_tethered {
+                    self.announcement = Some("Severing Aetheric Lightning Tether...".to_string());
+                    self.queue_packet(ClientPacket::ToggleTether { target_id: None });
+                } else if let Some(target_id) = target_opt {
+                    let ally_name = self.tick_state.as_ref().and_then(|t| t.players.iter().find(|p| p.id == target_id).map(|p| p.username.clone())).unwrap_or_else(|| "Ally".to_string());
                     if let Some(me) = self.my_player() {
                         self.spawn_floating_text(
                             me.pos,
-                            "* GATE SEALED! *".to_string(),
-                            ratatui::style::Color::Red,
+                            format!("* TETHER LINKED: @{} ⚡ *", ally_name),
+                            Color::Rgb(120, 240, 255),
                         );
                     }
-                    self.announcement = Some(
-                        "The gate to the stairs is sealed! Step on the Pressure Plate or slay the Floor Guardian to unseal the ascent!".to_string(),
-                    );
+                    self.announcement = Some(format!("Forging Aetheric Lightning Tether with @{}! Arc active!", ally_name));
+                    self.queue_packet(ClientPacket::ToggleTether { target_id: Some(target_id) });
                 } else {
-                    self.queue_packet(ClientPacket::AscendStairs);
+                    self.announcement = Some("No alive climbers nearby to tether (stand within 14 steps of a teammate)".to_string());
                 }
             }
-            KeyCode::Char('b') => {
+            KeyCode::Char('e') | KeyCode::Char('E') => {
+                // 1. Check if a fallen teammate is nearby to revive!
+                let fallen_ally = if let (Some(me), Some(tick)) = (self.my_player(), &self.tick_state) {
+                    tick.players
+                        .iter()
+                        .find(|p| p.id != me.id && !p.is_alive() && me.pos.manhattan_distance(p.pos) <= 2)
+                        .map(|p| (p.id.clone(), p.username.clone(), p.pos))
+                } else {
+                    None
+                };
+
+                if let Some((ally_id, ally_name, ally_pos)) = fallen_ally {
+                    self.spawn_floating_text(
+                        ally_pos,
+                        format!("* RESURRECTING @{}! *", ally_name),
+                        Color::Green,
+                    );
+                    self.announcement = Some(format!("Channeling spirit energy to revive @{}...", ally_name));
+                    self.queue_packet(ClientPacket::ReviveAlly { target_id: ally_id });
+                    return;
+                }
+
+                let player_info = self.my_player().map(|p| (p.pos, p.shards));
+                let is_near_shrine = if let (Some((pos, _)), Some(map)) = (player_info, &self.current_map) {
+                    map.shrine_pos.map_or(false, |sp| pos.chebyshev_distance(sp) <= 3)
+                        || self.tick_state.as_ref().map_or(false, |tick| {
+                            tick.tiles_override.iter().any(|(p, t)| *p == pos && matches!(t, hyaku_protocol::Tile::Shrine))
+                        })
+                        || map.get_tile(pos) == Some(hyaku_protocol::Tile::Shrine)
+                } else {
+                    false
+                };
+
+                if is_near_shrine {
+                    if let Some((pos, shards)) = player_info {
+                        if shards > 0 {
+                            self.spawn_floating_text(
+                                pos,
+                                format!("+{} SHARDS OFFERED [百]", shards),
+                                Color::Cyan,
+                            );
+                            self.announcement = Some(format!(
+                                "Offered {} shards to the Floor Shrine [百]!",
+                                shards
+                            ));
+                            self.queue_packet(ClientPacket::DepositShards { amount: shards });
+                        } else {
+                            self.announcement = Some(
+                                "You carry no shards to offer to the Shrine [百]. Slay guardians to collect shards!"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    return;
+                }
+
+                let is_near_stairs = if let (Some((pos, _)), Some(map)) = (player_info, &self.current_map) {
+                    pos.chebyshev_distance(map.stairs_pos) <= 2
+                        || map.get_tile(pos) == Some(hyaku_protocol::Tile::StairsUp)
+                } else {
+                    false
+                };
+
+                if is_near_stairs {
+                    let is_gate_locked = self.current_map.as_ref().map_or(false, |map| {
+                        if map.gates.is_empty() {
+                            return false;
+                        }
+                        map.gates.iter().any(|&(_id, gpos)| {
+                            if let Some(tick) = &self.tick_state {
+                                if let Some(&(_, hyaku_protocol::Tile::Gate { open, .. })) =
+                                    tick.tiles_override.iter().find(|(p, _)| *p == gpos)
+                                {
+                                    return !open;
+                                }
+                            }
+                            true
+                        })
+                    });
+
+                    let is_shrine_locked = self
+                        .tick_state
+                        .as_ref()
+                        .map_or(false, |tick| !tick.stairs_unlocked);
+
+                    if is_gate_locked {
+                        if let Some((pos, _)) = player_info {
+                            self.spawn_floating_text(
+                                pos,
+                                "* GATE SEALED! *".to_string(),
+                                ratatui::style::Color::Red,
+                            );
+                        }
+                        self.announcement = Some(
+                            "The gate to the stairs is sealed! Step on the Pressure Plate or slay the Floor Guardian to unseal the ascent!".to_string(),
+                        );
+                    } else if is_shrine_locked {
+                        if let Some((pos, _)) = player_info {
+                            self.spawn_floating_text(
+                                pos,
+                                "* SHRINE SEALED! *".to_string(),
+                                ratatui::style::Color::LightRed,
+                            );
+                        }
+                        let (cur, goal) = self
+                            .tick_state
+                            .as_ref()
+                            .map(|t| (t.shrine_shards, t.shrine_goal))
+                            .unwrap_or((0, 0));
+                        self.announcement = Some(format!(
+                            "The Stairs are sealed until the Shrine [百] offering is fulfilled ({}/{} Shards)! Offer shards at the Shrine [百]!",
+                            cur, goal
+                        ));
+                    } else {
+                        self.queue_packet(ClientPacket::AscendStairs);
+                    }
+                } else {
+                    self.announcement = Some(
+                        "Stand near the Shrine [百] to deposit shards, or stand on the Stairs [▲] to ascend!"
+                            .to_string(),
+                    );
+                }
+            }
+            KeyCode::Char('b') | KeyCode::Char('B') => {
+                let player_info = self.my_player().map(|p| (p.pos, p.shards));
+                let target_pos = player_info.map(|(pos, _)| pos.step(self.last_dir));
+                let is_chasm = if let (Some(tpos), Some(map)) = (target_pos, &self.current_map) {
+                    if let Some(tick) = &self.tick_state {
+                        if let Some(&(_, tile)) = tick.tiles_override.iter().find(|(p, _)| *p == tpos) {
+                            tile.is_chasm()
+                        } else {
+                            map.get_tile(tpos).map_or(false, |t| t.is_chasm())
+                        }
+                    } else {
+                        map.get_tile(tpos).map_or(false, |t| t.is_chasm())
+                    }
+                } else {
+                    false
+                };
+
+                if is_chasm {
+                    if let (Some((_pos, shards)), Some(tpos)) = (player_info, target_pos) {
+                        if shards >= 5 {
+                            self.spawn_floating_text(
+                                tpos,
+                                "* BRIDGE (═) *".to_string(),
+                                Color::Yellow,
+                            );
+                        }
+                    }
+                }
                 self.queue_packet(ClientPacket::BuildBridge(self.last_dir));
             }
-            KeyCode::Char('c') => {
+            KeyCode::Char('c') | KeyCode::Char('C') => {
                 self.queue_packet(ClientPacket::LightCampfire);
             }
-            KeyCode::Char('x') => {
-                self.queue_packet(ClientPacket::DeployDecoy);
-            }
-            KeyCode::Char('z') => {
+            KeyCode::Char('z') | KeyCode::Char('Z') => {
                 if let Some(player) = self.my_player() {
                     if player.shards > 0 {
-                        self.queue_packet(ClientPacket::DepositShards { amount: 5 });
+                        self.queue_packet(ClientPacket::DepositShards { amount: player.shards });
                     }
                 }
             }
@@ -656,6 +838,16 @@ impl AppState {
                     }
                 }
             }
+            ServerPacket::ServerBanner { title, message } => {
+                self.server_banner = Some(ServerBannerData {
+                    title: title.clone(),
+                    message: message.clone(),
+                    ttl: 240,
+                });
+                self.screen_flash = Some((Color::Cyan, 6));
+                self.announcement = Some(format!("★ {} ★ {}", title, message));
+                self.combat_log.push(format!("★ {} ★ {}", title, message));
+            }
             ServerPacket::Error { message } => {
                 self.announcement = Some(format!("Error: {}", message));
             }
@@ -729,6 +921,10 @@ mod tests {
             tiles_override: Vec::new(),
             carvings: Vec::new(),
             tower_shards_bank: 0,
+            decoys: Vec::new(),
+            shrine_shards: 0,
+            shrine_goal: 0,
+            stairs_unlocked: true,
         });
 
         // Center on (40, 15) with viewport 40x20
@@ -793,6 +989,10 @@ mod tests {
                 "Watch out for traps!".to_string(),
             )],
             tower_shards_bank: 0,
+            decoys: Vec::new(),
+            shrine_shards: 0,
+            shrine_goal: 0,
+            stairs_unlocked: true,
         });
 
         // Standing 1 step away -> carving is detected
@@ -809,5 +1009,84 @@ mod tests {
             }
             other => panic!("expected UpvoteCarving, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_client_keybinds_stage_6_coop_mechanics() {
+        let mut app = AppState::new(
+            "ZeHero".to_string(),
+            "ws://127.0.0.1:3000/ws".to_string(),
+            0,
+        );
+        app.screen = Screen::Connected;
+        app.my_player_id = Some("p-1".to_string());
+
+        let mut p = PlayerState::new("p-1".to_string(), "ZeHero".to_string(), 0, Position::new(20, 20), 1);
+        p.shards = 15;
+        p.mana = 40;
+
+        let mut map = FloorMap::new_empty(1, 80, 30);
+        map.shrine_pos = Some(Position::new(21, 20)); // Shrine adjacent to player
+        map.set_tile(Position::new(21, 20), hyaku_protocol::Tile::Shrine);
+        app.current_map = Some(map);
+
+        app.tick_state = Some(TickState {
+            tick: 1,
+            floor: 1,
+            players: vec![p],
+            enemies: Vec::new(),
+            projectiles: Vec::new(),
+            tiles_override: Vec::new(),
+            carvings: Vec::new(),
+            tower_shards_bank: 0,
+            decoys: Vec::new(),
+            shrine_shards: 0,
+            shrine_goal: 10,
+            stairs_unlocked: false,
+        });
+
+        // 1. Test [R] key: Deploys Holo-Decoy (20 MP)
+        app.handle_key(KeyCode::Char('r'));
+        assert_eq!(app.pop_outbound_packet(), Some(ClientPacket::DeployDecoy));
+
+        // 2. Test [B] key: Builds bridge in facing direction
+        app.last_dir = Direction::Right;
+        app.handle_key(KeyCode::Char('b'));
+        assert_eq!(app.pop_outbound_packet(), Some(ClientPacket::BuildBridge(Direction::Right)));
+
+        // 3. Test [E] key near Shrine: Deposits all held shards into Shrine [百]
+        app.handle_key(KeyCode::Char('e'));
+        assert_eq!(app.pop_outbound_packet(), Some(ClientPacket::DepositShards { amount: 15 }));
+
+        // 4. Test ServerBanner reception and TTL expiration
+        app.handle_server_packet(ServerPacket::ServerBanner {
+            title: "TOWER FLOOR 1 SHRINE UNLOCKED!".to_string(),
+            message: "The stairs are unsealed!".to_string(),
+        });
+        assert!(app.server_banner.is_some());
+        assert_eq!(app.server_banner.as_ref().unwrap().ttl, 240);
+
+        // Tick effects forward
+        for _ in 0..245 {
+            app.tick_effects();
+        }
+        assert!(app.server_banner.is_none(), "ServerBanner must expire after its TTL");
+
+        // 5. Test [T] key: Toggles Lightning Tether with closest ally
+        let mut ally = PlayerState::new("p-2".to_string(), "Ally".to_string(), 1, Position::new(22, 20), 1);
+        if let Some(ref mut ts) = app.tick_state {
+            ts.players.push(ally.clone());
+        }
+        app.handle_key(KeyCode::Char('t'));
+        assert_eq!(app.pop_outbound_packet(), Some(ClientPacket::ToggleTether { target_id: Some("p-2".to_string()) }));
+
+        // 6. Test [E] key near fallen ally: Resurrects comrade
+        ally.hp = 0;
+        if let Some(ref mut ts) = app.tick_state {
+            ts.players.retain(|p| p.id != "p-2");
+            ts.players.push(ally);
+        }
+        app.handle_key(KeyCode::Char('e'));
+        assert_eq!(app.pop_outbound_packet(), Some(ClientPacket::ReviveAlly { target_id: "p-2".to_string() }));
     }
 }

@@ -1,5 +1,5 @@
 use crate::direction::Direction;
-use crate::entity::{EnemyState, FloorCarving, PlayerState, ProjectileState};
+use crate::entity::{DecoyState, EnemyState, FloorCarving, PlayerState, ProjectileState};
 use crate::position::Position;
 use crate::tile::Tile;
 use serde::{Deserialize, Serialize};
@@ -30,6 +30,9 @@ pub enum ClientPacket {
     },
     AscendStairs,
     Respawn,
+    ReviveAlly {
+        target_id: String,
+    },
     Chat {
         text: String,
     },
@@ -58,6 +61,14 @@ pub struct TickState {
     pub tiles_override: Vec<(Position, Tile)>,
     pub carvings: Vec<FloorCarving>,
     pub tower_shards_bank: u32,
+    #[serde(default)]
+    pub decoys: Vec<DecoyState>,
+    #[serde(default)]
+    pub shrine_shards: u32,
+    #[serde(default)]
+    pub shrine_goal: u32,
+    #[serde(default)]
+    pub stairs_unlocked: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +91,10 @@ pub enum ServerPacket {
     },
     Announcement {
         text: String,
+    },
+    ServerBanner {
+        title: String,
+        message: String,
     },
     Error {
         message: String,

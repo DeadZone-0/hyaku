@@ -1,10 +1,21 @@
 use hyaku_protocol::{
-    ClientPacket, Direction, EnemyKind, EnemyState, FloorCarving, FloorMap, PlayerState,
+    ClientPacket, DecoyState, Direction, EnemyKind, EnemyState, FloorCarving, FloorMap, PlayerState,
     ProjectileState, ServerPacket, TickState, Tile, Position,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::UnboundedSender;
+
+/// Sanitizes user-supplied text to prevent ANSI escape sequence injection, terminal hijacking, and buffer bloat.
+pub fn sanitize_text(input: &str, max_chars: usize) -> String {
+    input
+        .chars()
+        .filter(|c| !c.is_control() && *c != '\x1b')
+        .take(max_chars)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
 
 pub struct FloorInstance {
     pub floor: u32,
@@ -16,6 +27,13 @@ pub struct FloorInstance {
     pub carvings: Vec<FloorCarving>,
     pub tick_counter: u64,
     pub player_campfires: HashMap<String, Position>,
+    pub decoys: Vec<DecoyState>,
+    pub next_decoy_id: u64,
+    pub shrine_shards: u32,
+    pub shrine_goal: u32,
+    pub stairs_unlocked: bool,
+    pub unlocked_gates: HashSet<u8>,
+    pub pending_announcements: Vec<String>,
 }
 
 impl FloorInstance {
@@ -32,6 +50,12 @@ impl FloorInstance {
             tiles_override.insert(pos, Tile::PressurePlate { id, active: false });
         }
 
+        let (shrine_goal, stairs_unlocked) = if floor == 1 {
+            (0, true)
+        } else {
+            (10 + (floor - 2) * 5, false)
+        };
+
         Self {
             floor,
             map: map.clone(),
@@ -42,7 +66,87 @@ impl FloorInstance {
             carvings: map.initial_carvings.clone(),
             tick_counter: 0,
             player_campfires: HashMap::new(),
+            decoys: Vec::new(),
+            next_decoy_id: 1,
+            shrine_shards: 0,
+            shrine_goal,
+            stairs_unlocked,
+            unlocked_gates: HashSet::new(),
+            pending_announcements: Vec::new(),
         }
+    }
+
+    pub fn drain_announcements(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_announcements)
+    }
+
+    pub fn check_pressure_plates(&mut self) -> Vec<String> {
+        let mut announcements = Vec::new();
+
+        // Check each plate on the map and update its active state
+        for &(gate_id, plate_pos) in &self.map.plates {
+            let occupied = self.players.values().any(|p| p.is_alive() && p.pos == plate_pos)
+                || self.decoys.iter().any(|d| d.pos == plate_pos);
+
+            let current_active = matches!(
+                self.tiles_override.get(&plate_pos),
+                Some(Tile::PressurePlate { active: true, .. })
+            );
+
+            if occupied != current_active {
+                self.tiles_override.insert(
+                    plate_pos,
+                    Tile::PressurePlate {
+                        id: gate_id,
+                        active: occupied,
+                    },
+                );
+            }
+        }
+
+        // Group plates by gate_id
+        let mut plates_by_gate: HashMap<u8, Vec<Position>> = HashMap::new();
+        for &(gid, pos) in &self.map.plates {
+            plates_by_gate.entry(gid).or_default().push(pos);
+        }
+
+        for (gid, plate_positions) in plates_by_gate {
+            if plate_positions.is_empty() {
+                continue;
+            }
+
+            let all_held = plate_positions.iter().all(|pos| {
+                self.players.values().any(|p| p.is_alive() && p.pos == *pos)
+                    || self.decoys.iter().any(|d| d.pos == *pos)
+            });
+
+            if all_held && !self.unlocked_gates.contains(&gid) {
+                self.unlocked_gates.insert(gid);
+
+                for &(gate_id, gate_pos) in &self.map.gates {
+                    if gate_id == gid {
+                        self.tiles_override
+                            .insert(gate_pos, Tile::Gate { id: gate_id, open: true });
+                    }
+                }
+
+                let plate_count = plate_positions.len();
+                let msg = if plate_count > 1 {
+                    format!(
+                        "* [CO-OP] All {} Pressure Plates for Gate #{} are held down! The Barrier Gate is UNSEALED! *",
+                        plate_count, gid
+                    )
+                } else {
+                    format!(
+                        "* [CO-OP] Pressure Plate #{} held down! The Barrier Gate is UNSEALED! *",
+                        gid
+                    )
+                };
+                announcements.push(msg);
+            }
+        }
+
+        announcements
     }
 
     pub fn get_effective_tile(&self, pos: Position) -> Option<Tile> {
@@ -111,25 +215,14 @@ impl FloorInstance {
 
         let mut event = None;
 
-        // Check if stepped on a pressure plate
-        if let Some(Tile::PressurePlate { id, active }) = self.get_effective_tile(target_pos) {
-            if !active {
-                self.tiles_override
-                    .insert(target_pos, Tile::PressurePlate { id, active: true });
-
-                // Open all corresponding gates
-                for &(gate_id, gate_pos) in &self.map.gates {
-                    if gate_id == id {
-                        self.tiles_override
-                            .insert(gate_pos, Tile::Gate { id: gate_id, open: true });
-                    }
-                }
-
-                event = Some(format!(
-                    "* [CO-OP] @{} stepped on Pressure Plate #{}! The Ascension Gate is UNSEALED! *",
-                    username, id
-                ));
-            }
+        let plate_events = self.check_pressure_plates();
+        if !plate_events.is_empty() {
+            event = Some(plate_events.join("\n"));
+        } else if let Some(Tile::PressurePlate { id, .. }) = self.get_effective_tile(target_pos) {
+            event = Some(format!(
+                "* [CO-OP] @{} stepped on Pressure Plate #{}! *",
+                username, id
+            ));
         }
 
         (true, event)
@@ -262,6 +355,20 @@ impl FloorInstance {
     pub fn step_tick(&mut self, tower_shards: u32) -> TickState {
         self.tick_counter = self.tick_counter.wrapping_add(1);
 
+        // Decoy timer decay (lasts remaining_ticks, decrement each tick)
+        self.decoys.retain_mut(|d| {
+            if d.remaining_ticks > 0 {
+                d.remaining_ticks -= 1;
+                d.remaining_ticks > 0
+            } else {
+                false
+            }
+        });
+
+        // Check pressure plates and record any unseal announcements
+        let plate_events = self.check_pressure_plates();
+        self.pending_announcements.extend(plate_events);
+
         // Campfire & Shrine regeneration every 20 ticks (1 sec at 20-TPS)
         if self.tick_counter % 20 == 0 {
             for player in self.players.values_mut() {
@@ -295,13 +402,11 @@ impl FloorInstance {
                 let mut closest_target: Option<Position> = None;
                 let mut min_dist = u32::MAX;
 
-                for (proj, _) in &self.projectiles {
-                    if proj.glyph == '?' {
-                        let d = enemy.pos.manhattan_distance(proj.pos);
-                        if d < min_dist && d <= 12 {
-                            min_dist = d;
-                            closest_target = Some(proj.pos);
-                        }
+                for decoy in &self.decoys {
+                    let d = enemy.pos.manhattan_distance(decoy.pos);
+                    if d < min_dist && d <= 12 {
+                        min_dist = d;
+                        closest_target = Some(decoy.pos);
                     }
                 }
 
@@ -366,6 +471,77 @@ impl FloorInstance {
             }
         }
 
+        // Lightning Tether electrical arc damage and energetic spark particles
+        if self.tick_counter % 2 == 0 {
+            let mut processed_pairs: HashSet<(String, String)> = HashSet::new();
+            let mut tether_events = Vec::new();
+
+            let player_tethers: Vec<(String, String, Position, String)> = self
+                .players
+                .values()
+                .filter(|p| p.is_alive() && p.tether_target.is_some())
+                .map(|p| (p.id.clone(), p.tether_target.clone().unwrap(), p.pos, p.username.clone()))
+                .collect();
+
+            for (p1_id, target_id, p1_pos, p1_name) in player_tethers {
+                let pair_key = if p1_id < target_id {
+                    (p1_id.clone(), target_id.clone())
+                } else {
+                    (target_id.clone(), p1_id.clone())
+                };
+
+                if processed_pairs.contains(&pair_key) {
+                    continue;
+                }
+                processed_pairs.insert(pair_key);
+
+                if let Some(target_player) = self.players.get(&target_id) {
+                    if target_player.is_alive() && p1_pos.manhattan_distance(target_player.pos) <= 14 {
+                        let target_pos = target_player.pos;
+                        let target_name = target_player.username.clone();
+                        let line_points = p1_pos.line_to(target_pos);
+
+                        for pt in line_points {
+                            if pt == p1_pos || pt == target_pos {
+                                continue;
+                            }
+                            // Spawn energetic spark particle along tether beam
+                            self.projectiles.push((
+                                ProjectileState::new(pt, '⚡', (120, 240, 255)),
+                                1,
+                            ));
+
+                            // Electrocute enemies intersecting the beam
+                            for enemy in self.enemies.iter_mut() {
+                                if enemy.is_alive() && enemy.pos == pt {
+                                    enemy.take_damage(8);
+                                    let dead = !enemy.is_alive();
+                                    if dead {
+                                        let enemy_name = enemy.kind.name();
+                                        tether_events.push((
+                                            p1_id.clone(),
+                                            target_id.clone(),
+                                            format!(":: TETHER DISCHARGE :: @{} and @{} electrocuted {}!", p1_name, target_name, enemy_name),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            for (p1_id, p2_id, event) in tether_events {
+                self.pending_announcements.push(event);
+                if let Some(p1) = self.players.get_mut(&p1_id) {
+                    p1.shards += 2;
+                }
+                if let Some(p2) = self.players.get_mut(&p2_id) {
+                    p2.shards += 2;
+                }
+            }
+        }
+
         // Projectile decay (lasts specified TTL ticks)
         self.projectiles.retain_mut(|(proj, ttl)| {
             if *ttl > 0 && proj.pos.in_bounds(self.map.width, self.map.height) {
@@ -385,6 +561,7 @@ impl FloorInstance {
         if prev_boss_alive && !boss_still_alive {
             println!("[HYAKU BOSS] Floor {} boss has fallen! All barrier gates unlocked.", self.floor);
             for &(gate_id, gate_pos) in &self.map.gates {
+                self.unlocked_gates.insert(gate_id);
                 self.tiles_override
                     .insert(gate_pos, Tile::Gate { id: gate_id, open: true });
             }
@@ -399,6 +576,10 @@ impl FloorInstance {
             tiles_override: self.tiles_override.iter().map(|(&p, &t)| (p, t)).collect(),
             carvings: self.carvings.clone(),
             tower_shards_bank: tower_shards,
+            decoys: self.decoys.clone(),
+            shrine_shards: self.shrine_shards,
+            shrine_goal: self.shrine_goal,
+            stairs_unlocked: self.stairs_unlocked,
         }
     }
 }
@@ -470,6 +651,13 @@ impl ServerState {
     pub fn handle_packet(&mut self, player_id: &str, packet: ClientPacket) {
         match packet {
             ClientPacket::Join { username, class_idx } => {
+                let clean_name = sanitize_text(&username, 24);
+                let username = if clean_name.is_empty() {
+                    "Climber".to_string()
+                } else {
+                    clean_name
+                };
+
                 let start_floor = 1;
                 let world_seed = self.world_seed;
                 let floor_inst = self.get_or_create_floor(start_floor);
@@ -828,72 +1016,209 @@ impl ServerState {
 
             ClientPacket::ToggleTether { target_id } => {
                 if let Some(&floor_num) = self.client_floors.get(player_id) {
+                    let mut tether_msg = None;
                     if let Some(floor) = self.floors.get_mut(&floor_num) {
+                        let my_name = floor.players.get(player_id).map(|p| p.username.clone()).unwrap_or_default();
                         if let Some(player) = floor.players.get_mut(player_id) {
-                            player.tether_target = target_id;
+                            if player.tether_target == target_id {
+                                player.tether_target = None;
+                                tether_msg = Some(format!("* [TETHER] @{} severed their Aetheric Lightning Tether. *", my_name));
+                            } else {
+                                player.tether_target = target_id.clone();
+                                if let Some(ref tid) = target_id {
+                                    let target_name = floor.players.get(tid).map(|p| p.username.clone()).unwrap_or_else(|| "Ally".to_string());
+                                    tether_msg = Some(format!("* [CO-OP] @{} forged an Aetheric Lightning Tether with @{}! Electric arcing connects you! *", my_name, target_name));
+                                }
+                            }
                         }
+                    }
+                    if let Some(text) = tether_msg {
+                        self.broadcast_to_floor(floor_num, ServerPacket::Announcement { text });
+                    }
+                }
+            }
+
+            ClientPacket::ReviveAlly { target_id } => {
+                if let Some(&floor_num) = self.client_floors.get(player_id) {
+                    let mut revive_payload = None;
+                    if let Some(floor) = self.floors.get_mut(&floor_num) {
+                        let my_info = floor.players.get(player_id).and_then(|p| {
+                            if p.is_alive() {
+                                Some((p.pos, p.username.clone()))
+                            } else {
+                                None
+                            }
+                        });
+
+                        if let Some((my_pos, my_name)) = my_info {
+                            if let Some(target) = floor.players.get_mut(&target_id) {
+                                if !target.is_alive() && my_pos.manhattan_distance(target.pos) <= 2 {
+                                    target.hp = target.max_hp / 2;
+                                    target.mana = target.max_mana / 2;
+                                    let target_name = target.username.clone();
+                                    let target_pos = target.pos;
+
+                                    floor.projectiles.push((
+                                        ProjectileState::new(target_pos, '✚', (120, 255, 160)),
+                                        6,
+                                    ));
+
+                                    revive_payload = Some((
+                                        format!("* [CO-OP REVIVAL] @{} channeled spirit energy to resurrect fallen comrade @{}! *", my_name, target_name),
+                                        "++ CLIMBER RESURRECTED ++".to_string(),
+                                        format!(":: HEROIC RESCUE :: @{} brought @{} back into the fight with 50% HP!", my_name, target_name)
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some((announcement, banner_title, banner_msg)) = revive_payload {
+                        self.broadcast_to_floor(floor_num, ServerPacket::Announcement { text: announcement });
+                        self.broadcast_to_floor(floor_num, ServerPacket::ServerBanner {
+                            title: banner_title,
+                            message: banner_msg,
+                        });
                     }
                 }
             }
 
             ClientPacket::DeployDecoy => {
                 if let Some(&floor_num) = self.client_floors.get(player_id) {
+                    let mut unseal_events = Vec::new();
+                    let mut deploy_announcement = None;
+                    let mut direct_msg = None;
+
                     if let Some(floor) = self.floors.get_mut(&floor_num) {
-                        if let Some(player) = floor.players.get_mut(player_id) {
-                            if player.spend_mana(25) {
-                                floor.projectiles.push((
-                                    ProjectileState::new(
-                                        player.pos,
-                                        '?',
-                                        (120, 200, 255),
-                                    ),
-                                    200, // 200 ticks = 10 seconds decoy
-                                ));
-                                println!(
-                                    "[HYAKU ACTION] Player '{}' deployed Holo-Decoy at ({}, {}) (-25 MP)",
-                                    player.username, player.pos.x, player.pos.y
-                                );
-                                if let Some(tx) = self.clients.get(player_id) {
-                                    let _ = tx.send(ServerPacket::Announcement {
-                                        text: "Holo-Decoy deployed! (-25 MP, lasts 10s)".to_string(),
-                                    });
-                                }
+                        let player_opt = floor.players.get_mut(player_id).and_then(|p| {
+                            if p.is_alive() {
+                                Some((p.pos, p.username.clone(), p.spend_mana(20)))
                             } else {
-                                if let Some(tx) = self.clients.get(player_id) {
-                                    let _ = tx.send(ServerPacket::Announcement {
-                                        text: format!("Need 25 Mana for Holo-Decoy! (You have {})", player.mana),
-                                    });
-                                }
+                                None
+                            }
+                        });
+
+                        if let Some((pos, username, mana_spent)) = player_opt {
+                            if mana_spent {
+                                let decoy_id = floor.next_decoy_id;
+                                floor.next_decoy_id += 1;
+
+                                // Holo-Decoy: 15 seconds at 20-TPS = 300 ticks
+                                let decoy = DecoyState::new(decoy_id, username.clone(), pos, 300);
+                                floor.decoys.push(decoy);
+
+                                floor.projectiles.push((
+                                    ProjectileState::new(pos, '§', (120, 220, 255)),
+                                    6,
+                                ));
+
+                                unseal_events = floor.check_pressure_plates();
+
+                                println!(
+                                    "[HYAKU ACTION] Player '{}' deployed Holo-Decoy at ({}, {}) (-20 MP, 15s)",
+                                    username, pos.x, pos.y
+                                );
+
+                                deploy_announcement = Some(format!(
+                                    "* [HOLO-DECOY] @{} projected a Holo-Decoy at ({}, {})! (Lasts 15s, holds pressure plates) *",
+                                    username, pos.x, pos.y
+                                ));
+                            } else {
+                                let cur_mana = floor.players.get(player_id).map(|p| p.mana).unwrap_or(0);
+                                direct_msg = Some(format!("Need 20 Mana for Holo-Decoy! (You have {})", cur_mana));
                             }
                         }
+                    }
+
+                    if let Some(msg) = direct_msg {
+                        if let Some(tx) = self.clients.get(player_id) {
+                            let _ = tx.send(ServerPacket::Announcement { text: msg });
+                        }
+                    }
+
+                    if let Some(ann) = deploy_announcement {
+                        self.broadcast_to_floor(floor_num, ServerPacket::Announcement { text: ann });
+                    }
+
+                    for event in unseal_events {
+                        self.broadcast_to_floor(floor_num, ServerPacket::Announcement { text: event });
                     }
                 }
             }
 
             ClientPacket::DepositShards { amount } => {
                 if let Some(&floor_num) = self.client_floors.get(player_id) {
+                    let mut unsealed_stairs = false;
+                    let mut banner_payload = None;
+                    let mut deposit_announcement = None;
+                    let mut direct_msg = None;
+
                     if let Some(floor) = self.floors.get_mut(&floor_num) {
-                        if let Some(player) = floor.players.get_mut(player_id) {
-                            let deposit = amount.min(player.shards);
-                            if deposit > 0 {
-                                player.shards -= deposit;
-                                self.tower_shards_bank += deposit;
-                                println!(
-                                    "[HYAKU BANK] Player '{}' deposited {} shards. Total Tower Bank: {}",
-                                    player.username, deposit, self.tower_shards_bank
-                                );
-                                if let Some(tx) = self.clients.get(player_id) {
-                                    let _ = tx.send(ServerPacket::Announcement {
-                                        text: format!("Deposited {} shards! Total Tower Bank: {}", deposit, self.tower_shards_bank),
-                                    });
-                                }
+                        let player_info = floor.players.get(player_id).and_then(|p| {
+                            if p.is_alive() {
+                                Some((p.pos, p.shards, p.username.clone()))
                             } else {
-                                if let Some(tx) = self.clients.get(player_id) {
-                                    let _ = tx.send(ServerPacket::Announcement {
-                                        text: "You have 0 shards to deposit!".to_string(),
-                                    });
+                                None
+                            }
+                        });
+
+                        if let Some((pos, shards, username)) = player_info {
+                            let near_shrine = floor.map.shrine_pos.map_or(false, |sp| {
+                                pos.chebyshev_distance(sp) <= 3
+                            }) || matches!(floor.get_effective_tile(pos), Some(Tile::Shrine));
+
+                            if !near_shrine {
+                                direct_msg = Some("You must stand near the Floor Shrine [百] to deposit shards!".to_string());
+                            } else {
+                                let deposit = amount.min(shards);
+                                if deposit > 0 {
+                                    if let Some(p) = floor.players.get_mut(player_id) {
+                                        p.shards -= deposit;
+                                    }
+                                    floor.shrine_shards += deposit;
+                                    self.tower_shards_bank += deposit;
+
+                                    println!(
+                                        "[HYAKU SHRINE] Player '{}' deposited {} shards into Floor {} Shrine ({}/{} Shards). Bank: {}",
+                                        username, deposit, floor_num, floor.shrine_shards, floor.shrine_goal, self.tower_shards_bank
+                                    );
+
+                                    deposit_announcement = Some(format!(
+                                        "* [SHRINE] @{} offered {} Shards to Floor Shrine [百]! Progress: {}/{} Shards *",
+                                        username, deposit, floor.shrine_shards, floor.shrine_goal
+                                    ));
+
+                                    if floor.shrine_shards >= floor.shrine_goal && !floor.stairs_unlocked {
+                                        floor.stairs_unlocked = true;
+                                        unsealed_stairs = true;
+                                        banner_payload = Some((
+                                            format!("★ [百] TOWER FLOOR {} SHRINE FULFILLED! ★", floor_num),
+                                            format!(
+                                                "The shard offering ({}/{}) is complete! The Ascension Stairs have been UNSEALED!",
+                                                floor.shrine_shards, floor.shrine_goal
+                                            ),
+                                        ));
+                                    }
+                                } else {
+                                    direct_msg = Some("You have 0 shards to deposit!".to_string());
                                 }
                             }
+                        }
+                    }
+
+                    if let Some(msg) = direct_msg {
+                        if let Some(tx) = self.clients.get(player_id) {
+                            let _ = tx.send(ServerPacket::Announcement { text: msg });
+                        }
+                    }
+
+                    if let Some(ann) = deposit_announcement {
+                        self.broadcast_to_floor(floor_num, ServerPacket::Announcement { text: ann });
+                    }
+
+                    if unsealed_stairs {
+                        if let Some((title, message)) = banner_payload {
+                            self.broadcast_to_all(ServerPacket::ServerBanner { title, message });
                         }
                     }
                 }
@@ -901,47 +1226,64 @@ impl ServerState {
 
             ClientPacket::BuildBridge(dir) => {
                 if let Some(&floor_num) = self.client_floors.get(player_id) {
+                    let mut direct_msg = None;
+                    let mut bridge_announcement = None;
+
                     if let Some(floor) = self.floors.get_mut(&floor_num) {
-                        let player_info = floor.players.get(player_id).map(|p| {
-                            (p.pos, p.class_idx, p.shards, p.username.clone())
+                        let player_info = floor.players.get(player_id).and_then(|p| {
+                            if p.is_alive() {
+                                Some((p.pos, p.shards, p.username.clone()))
+                            } else {
+                                None
+                            }
                         });
 
-                        if let Some((pos, class_idx, shards, username)) = player_info {
+                        if let Some((pos, shards, username)) = player_info {
                             let target_pos = pos.step(dir);
-                            let tile = floor.get_effective_tile(target_pos);
-                            if tile.map_or(true, |t| !t.is_chasm()) {
-                                if let Some(tx) = self.clients.get(player_id) {
-                                    let _ = tx.send(ServerPacket::Announcement {
-                                        text: "No chasm in front of you to bridge!".to_string(),
-                                    });
-                                }
-                                return;
-                            }
-
-                            // Architect class gets discount: 1 shard vs 3 shards
-                            let cost = if class_idx == 3 { 1 } else { 3 };
-                            if shards >= cost {
-                                if let Some(p) = floor.players.get_mut(player_id) {
-                                    p.shards -= cost;
-                                }
-                                floor.tiles_override.insert(target_pos, Tile::Bridge);
-                                println!(
-                                    "[HYAKU ACTION] Player '{}' built bridge at ({}, {}) (-{} shards)",
-                                    username, target_pos.x, target_pos.y, cost
-                                );
-                                if let Some(tx) = self.clients.get(player_id) {
-                                    let _ = tx.send(ServerPacket::Announcement {
-                                        text: format!("Bridge constructed! (-{} shards)", cost),
-                                    });
-                                }
+                            if !target_pos.in_bounds(floor.map.width, floor.map.height) {
+                                direct_msg = Some("Target bridge position is out of bounds!".to_string());
                             } else {
-                                if let Some(tx) = self.clients.get(player_id) {
-                                    let _ = tx.send(ServerPacket::Announcement {
-                                        text: format!("Need {} shards to build a bridge! (You have {})", cost, shards),
-                                    });
+                                let tile = floor.get_effective_tile(target_pos);
+                                if tile.map_or(true, |t| !t.is_chasm()) {
+                                    direct_msg = Some("No abyssal chasm in front of you to bridge!".to_string());
+                                } else {
+                                    const BRIDGE_COST: u32 = 5;
+                                    if shards >= BRIDGE_COST {
+                                        if let Some(p) = floor.players.get_mut(player_id) {
+                                            p.shards -= BRIDGE_COST;
+                                        }
+                                        floor.tiles_override.insert(target_pos, Tile::Bridge);
+                                        floor.projectiles.push((
+                                            ProjectileState::new(target_pos, '═', (255, 215, 80)),
+                                            4,
+                                        ));
+                                        println!(
+                                            "[HYAKU ACTION] Player '{}' built bridge at ({}, {}) (-{} shards)",
+                                            username, target_pos.x, target_pos.y, BRIDGE_COST
+                                        );
+                                        bridge_announcement = Some(format!(
+                                            "* [CO-OP] @{} constructed a permanent Bridge (═) across the chasm! (-{} Shards) *",
+                                            username, BRIDGE_COST
+                                        ));
+                                    } else {
+                                        direct_msg = Some(format!(
+                                            "Need {} shards to build a bridge! (You have {})",
+                                            BRIDGE_COST, shards
+                                        ));
+                                    }
                                 }
                             }
                         }
+                    }
+
+                    if let Some(msg) = direct_msg {
+                        if let Some(tx) = self.clients.get(player_id) {
+                            let _ = tx.send(ServerPacket::Announcement { text: msg });
+                        }
+                    }
+
+                    if let Some(ann) = bridge_announcement {
+                        self.broadcast_to_floor(floor_num, ServerPacket::Announcement { text: ann });
                     }
                 }
             }
@@ -1011,10 +1353,10 @@ impl ServerState {
                 if let Some(&floor_num) = self.client_floors.get(player_id) {
                     if let Some(floor) = self.floors.get_mut(&floor_num) {
                         if let Some(player) = floor.players.get(player_id) {
-                            let clean_msg = message.trim();
+                            let clean_msg = sanitize_text(&message, 80);
                             if !clean_msg.is_empty() {
                                 let author = player.username.clone();
-                                let carving = FloorCarving::new(player.pos, author.clone(), clean_msg.to_string());
+                                let carving = FloorCarving::new(player.pos, author.clone(), clean_msg.clone());
                                 floor.carvings.push(carving);
                                 println!(
                                     "[HYAKU CARVING] Player '{}' carved message at ({}, {}): '{}'",
@@ -1068,12 +1410,17 @@ impl ServerState {
                                 });
 
                                 if is_gate_locked {
-                                    rejection_msg = Some(":: ASCENSION SEALED :: The gate to the stairs is locked! Unlock it via the Pressure Plate or by slaying the Floor Guardian!");
+                                    rejection_msg = Some(":: ASCENSION SEALED :: The gate to the stairs is locked! Unlock it via the Pressure Plate or by slaying the Floor Guardian!".to_string());
+                                } else if !floor.stairs_unlocked {
+                                    rejection_msg = Some(format!(
+                                        ":: SHRINE SEALED :: The Stairs are sealed until the Shrine [百] offering is fulfilled ({}/{} Shards)!",
+                                        floor.shrine_shards, floor.shrine_goal
+                                    ));
                                 } else {
                                     can_ascend = true;
                                 }
                             } else {
-                                rejection_msg = Some("You must stand on the Stairs to ascend!");
+                                rejection_msg = Some("You must stand on the Stairs to ascend!".to_string());
                             }
                         }
                         if can_ascend {
@@ -1148,6 +1495,11 @@ impl ServerState {
             }
 
             ClientPacket::Chat { text } => {
+                let clean_text = sanitize_text(&text, 120);
+                if clean_text.is_empty() {
+                    return;
+                }
+
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_secs())
@@ -1159,7 +1511,7 @@ impl ServerState {
                         .get_mut(&floor_num)
                         .and_then(|f| f.players.get_mut(player_id))
                         .map(|p| {
-                            p.last_chat = Some((text.clone(), now));
+                            p.last_chat = Some((clean_text.clone(), now));
                             p.username.clone()
                         })
                         .unwrap_or_else(|| "Adventurer".to_string());
@@ -1168,7 +1520,7 @@ impl ServerState {
                         floor_num,
                         ServerPacket::ChatMessage {
                             sender: sender_name,
-                            text,
+                            text: clean_text,
                             timestamp: now,
                         },
                     );
@@ -1321,5 +1673,305 @@ mod tests {
         // Attempt ascension again -> should succeed to Floor 2!
         server.handle_packet(&client_id, ClientPacket::AscendStairs);
         assert_eq!(server.client_floors.get(&client_id).copied(), Some(2));
+    }
+
+    #[test]
+    fn test_multi_plate_lock_coop_and_decoy() {
+        let mut floor = FloorInstance::new(1, 42);
+        let gate_pos = Position::new(20, 20);
+        let plate1_pos = Position::new(21, 20);
+        let plate2_pos = Position::new(22, 20);
+
+        floor.map.gates = vec![(1, gate_pos)];
+        floor.map.plates = vec![(1, plate1_pos), (1, plate2_pos)];
+        floor.tiles_override.insert(gate_pos, Tile::Gate { id: 1, open: false });
+        floor.tiles_override.insert(plate1_pos, Tile::PressurePlate { id: 1, active: false });
+        floor.tiles_override.insert(plate2_pos, Tile::PressurePlate { id: 1, active: false });
+
+        let p1 = PlayerState::new("p1".to_string(), "Alice".to_string(), 0, plate1_pos, 1);
+        floor.add_player(p1);
+
+        // Only plate 1 is occupied -> Gate 1 MUST remain locked!
+        let unseal_events = floor.check_pressure_plates();
+        assert!(unseal_events.is_empty());
+        assert_eq!(floor.tiles_override.get(&gate_pos), Some(&Tile::Gate { id: 1, open: false }));
+
+        // Now spawn Holo-Decoy on plate 1, and move Alice to plate 2
+        floor.decoys.push(DecoyState::new(1, "Alice".to_string(), plate1_pos, 300));
+        floor.players.get_mut("p1").unwrap().pos = plate2_pos;
+
+        // Both plates are now held simultaneously (Plate 1 by Decoy, Plate 2 by Alice)!
+        let unseal_events = floor.check_pressure_plates();
+        assert!(!unseal_events.is_empty());
+        assert!(unseal_events[0].contains("All 2 Pressure Plates"));
+        assert_eq!(floor.tiles_override.get(&gate_pos), Some(&Tile::Gate { id: 1, open: true }));
+        assert!(floor.unlocked_gates.contains(&1));
+    }
+
+    #[test]
+    fn test_holo_decoy_mana_and_tick_expiration() {
+        let mut server = ServerState::new(42);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let client_id = "decoy-wizard".to_string();
+
+        server.register_client(client_id.clone(), tx);
+        server.handle_packet(
+            &client_id,
+            ClientPacket::Join {
+                username: "Wizard".to_string(),
+                class_idx: 1, // Arcanist (120 Max Mana)
+            },
+        );
+
+        let floor = server.floors.get_mut(&1).unwrap();
+        let p = floor.players.get_mut(&client_id).unwrap();
+        p.mana = 30; // Set mana to 30
+
+        // Deploy Holo-Decoy (costs 20 Mana)
+        server.handle_packet(&client_id, ClientPacket::DeployDecoy);
+
+        let floor = server.floors.get_mut(&1).unwrap();
+        let p = floor.players.get(&client_id).unwrap();
+        assert_eq!(p.mana, 10, "Deploying Holo-Decoy must deduct exactly 20 Mana");
+        assert_eq!(floor.decoys.len(), 1, "Decoy must be spawned on the floor");
+        assert_eq!(floor.decoys[0].remaining_ticks, 300, "Decoy must have 15s (300 ticks) duration");
+
+        // Step floor 299 ticks -> Decoy should still be alive with 1 tick left
+        for _ in 0..299 {
+            floor.step_tick(0);
+        }
+        assert_eq!(floor.decoys.len(), 1);
+        assert_eq!(floor.decoys[0].remaining_ticks, 1);
+
+        // Step 1 more tick -> Decoy expires and is removed!
+        floor.step_tick(0);
+        assert_eq!(floor.decoys.len(), 0, "Decoy must expire after 300 ticks");
+    }
+
+    #[test]
+    fn test_bridge_building_spends_5_shards() {
+        let mut server = ServerState::new(42);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let client_id = "bridge-builder".to_string();
+
+        server.register_client(client_id.clone(), tx);
+        server.handle_packet(
+            &client_id,
+            ClientPacket::Join {
+                username: "Bob".to_string(),
+                class_idx: 0,
+            },
+        );
+        let _ = rx.try_recv().expect("welcome");
+
+        let pos = Position::new(10, 10);
+        let chasm_pos = Position::new(11, 10); // East of pos
+
+        {
+            let floor = server.floors.get_mut(&1).unwrap();
+            let p = floor.players.get_mut(&client_id).unwrap();
+            p.pos = pos;
+            p.shards = 8; // 8 shards
+            floor.tiles_override.insert(chasm_pos, Tile::Chasm);
+        }
+
+        // Build Bridge East into Chasm
+        server.handle_packet(&client_id, ClientPacket::BuildBridge(Direction::Right));
+
+        {
+            let floor = server.floors.get(&1).unwrap();
+            let p = floor.players.get(&client_id).unwrap();
+            assert_eq!(p.shards, 3, "Building a bridge must spend exactly 5 shards");
+            assert_eq!(
+                floor.get_effective_tile(chasm_pos),
+                Some(Tile::Bridge),
+                "Chasm must become a permanent Bridge tile"
+            );
+        }
+
+        // Try building again with 3 shards (insufficient)
+        let chasm_pos2 = Position::new(9, 10); // West of pos
+        {
+            let floor = server.floors.get_mut(&1).unwrap();
+            floor.tiles_override.insert(chasm_pos2, Tile::Chasm);
+        }
+
+        server.handle_packet(&client_id, ClientPacket::BuildBridge(Direction::Left));
+
+        {
+            let floor = server.floors.get(&1).unwrap();
+            let p = floor.players.get(&client_id).unwrap();
+            assert_eq!(p.shards, 3, "Shards should not be deducted on failure");
+            assert_eq!(floor.get_effective_tile(chasm_pos2), Some(Tile::Chasm));
+        }
+
+        // Check announcement about needing 5 shards
+        let mut found_cost_msg = false;
+        while let Ok(packet) = rx.try_recv() {
+            if let ServerPacket::Announcement { text } = packet {
+                if text.contains("Need 5 shards") {
+                    found_cost_msg = true;
+                }
+            }
+        }
+        assert!(found_cost_msg);
+    }
+
+    #[test]
+    fn test_shrine_unlock_and_server_banner() {
+        let mut server = ServerState::new(42);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let client_id = "shrine-hero".to_string();
+
+        server.register_client(client_id.clone(), tx);
+        server.handle_packet(
+            &client_id,
+            ClientPacket::Join {
+                username: "Hero".to_string(),
+                class_idx: 0,
+            },
+        );
+        let _ = rx.try_recv().expect("welcome");
+
+        // Move player to Floor 2
+        server.client_floors.insert(client_id.clone(), 2);
+        let floor2 = server.get_or_create_floor(2);
+        let shrine_pos = floor2.map.shrine_pos.unwrap();
+        let stairs_pos = floor2.map.stairs_pos;
+
+        let player = PlayerState::new(client_id.clone(), "Hero".to_string(), 0, shrine_pos, 2);
+        floor2.add_player(player);
+        floor2.shrine_goal = 10;
+        floor2.shrine_shards = 0;
+        floor2.stairs_unlocked = false;
+
+        // Player has 12 shards
+        floor2.players.get_mut(&client_id).unwrap().shards = 12;
+
+        // Unlock gates on floor 2 so only shrine locks the stairs
+        for &(gid, gpos) in &floor2.map.gates.clone() {
+            floor2.tiles_override.insert(gpos, Tile::Gate { id: gid, open: true });
+        }
+
+        // Try ascending while stairs are shrine-sealed
+        floor2.players.get_mut(&client_id).unwrap().pos = stairs_pos;
+        server.handle_packet(&client_id, ClientPacket::AscendStairs);
+        assert_eq!(server.client_floors.get(&client_id).copied(), Some(2), "Ascent must be sealed");
+
+        // Move back to shrine and deposit shards
+        {
+            let f2 = server.floors.get_mut(&2).unwrap();
+            f2.players.get_mut(&client_id).unwrap().pos = shrine_pos;
+        }
+
+        // Deposit 10 shards to meet the goal
+        server.handle_packet(&client_id, ClientPacket::DepositShards { amount: 10 });
+
+        {
+            let f2 = server.floors.get(&2).unwrap();
+            assert_eq!(f2.shrine_shards, 10);
+            assert!(f2.stairs_unlocked, "StairsUp must unlock when shrine goal is met");
+        }
+
+        // Verify ServerBanner popup packet was broadcast to client
+        let mut banner_received = false;
+        while let Ok(packet) = rx.try_recv() {
+            if let ServerPacket::ServerBanner { title, message } = packet {
+                if title.contains("SHRINE FULFILLED") && message.contains("UNSEALED") {
+                    banner_received = true;
+                }
+            }
+        }
+        assert!(banner_received, "ServerBanner must be received across terminals on shrine fulfillment");
+
+        // Now move to stairs and ascend -> should succeed to Floor 3!
+        {
+            let f2 = server.floors.get_mut(&2).unwrap();
+            f2.players.get_mut(&client_id).unwrap().pos = stairs_pos;
+        }
+
+        server.handle_packet(&client_id, ClientPacket::AscendStairs);
+        assert_eq!(server.client_floors.get(&client_id).copied(), Some(3), "Ascent must succeed to Floor 3");
+    }
+
+    #[test]
+    fn test_text_sanitization_security() {
+        use super::sanitize_text;
+
+        // Strip ANSI escape codes
+        let malicious_ansi = "\x1b[2J\x1b[H\x1b[31mHacker\x1b[0m";
+        let clean = sanitize_text(malicious_ansi, 24);
+        assert_eq!(clean, "[2J[H[31mHacker[0m");
+        assert!(!clean.contains('\x1b'));
+
+        // Strip control characters (tabs, newlines, nulls)
+        let control_chars = "Hello\x00\r\n\tWorld!";
+        let clean_ctrl = sanitize_text(control_chars, 30);
+        assert_eq!(clean_ctrl, "HelloWorld!");
+
+        // Enforce max length truncation
+        let long_string = "a".repeat(200);
+        let truncated = sanitize_text(&long_string, 20);
+        assert_eq!(truncated.len(), 20);
+    }
+
+    #[test]
+    fn test_lightning_tether_damage_and_shards() {
+        let mut server = ServerState::new(123);
+        let f = server.get_or_create_floor(1);
+
+        let mut p1 = PlayerState::new("p1".to_string(), "Alice".to_string(), 0, Position::new(10, 10), 1);
+        p1.tether_target = Some("p2".to_string());
+        let p2 = PlayerState::new("p2".to_string(), "Bob".to_string(), 1, Position::new(14, 10), 1);
+
+        f.add_player(p1);
+        f.add_player(p2);
+
+        // Place an enemy right between Alice and Bob at (12, 10)
+        let enemy = EnemyState::new(99, EnemyKind::Crawler, Position::new(12, 10), 1.0);
+        f.enemies.push(enemy);
+
+        // Step ticks to trigger tether cycle (even tick)
+        f.step_tick(0);
+        f.step_tick(0);
+
+        // Crawler has 30 HP, takes 8 DMG -> HP = 22
+        let enemy = f.enemies.iter().find(|e| e.id == 99).unwrap();
+        assert_eq!(enemy.hp, 22, "Enemy intersected by tether must take damage");
+
+        // Verify spark projectile exists on the line
+        assert!(f.projectiles.iter().any(|(p, _)| p.pos == Position::new(12, 10) && p.glyph == '⚡'));
+    }
+
+    #[test]
+    fn test_coop_ally_revival() {
+        let mut server = ServerState::new(123);
+        let (tx1, _rx1) = mpsc::unbounded_channel();
+        let (tx2, _rx2) = mpsc::unbounded_channel();
+
+        server.register_client("hero-1".to_string(), tx1);
+        server.register_client("hero-2".to_string(), tx2);
+
+        server.client_floors.insert("hero-1".to_string(), 1);
+        server.client_floors.insert("hero-2".to_string(), 1);
+
+        let p1 = PlayerState::new("hero-1".to_string(), "Alice".to_string(), 0, Position::new(10, 10), 1);
+        let mut p2 = PlayerState::new("hero-2".to_string(), "Bob".to_string(), 1, Position::new(11, 10), 1);
+        p2.hp = 0; // Fallen hero
+
+        {
+            let f = server.get_or_create_floor(1);
+            f.add_player(p1);
+            f.add_player(p2);
+            assert!(!f.players.get("hero-2").unwrap().is_alive());
+        }
+
+        // Alice revives Bob
+        server.handle_packet("hero-1", ClientPacket::ReviveAlly { target_id: "hero-2".to_string() });
+
+        let f = server.get_or_create_floor(1);
+        let revived_bob = f.players.get("hero-2").unwrap();
+        assert!(revived_bob.is_alive());
+        assert_eq!(revived_bob.hp, revived_bob.max_hp / 2);
     }
 }

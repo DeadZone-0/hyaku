@@ -20,11 +20,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Parse CLI arguments
     let mut args = std::env::args().skip(1);
     let mut username = "Adventurer".to_string();
-    let mut server_url = "ws://127.0.0.1:3000/ws".to_string();
+    let default_server = std::env::var("HYAKU_SERVER")
+        .unwrap_or_else(|_| "ws://[2a01:4f9:3080:3192::2124]:3000/ws".to_string());
+    let mut server_url = default_server;
     let mut class_idx = 0;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--help" | "-h" => {
+                println!(
+                    "HYAKU (百) - 100-Floor Co-op Tower Ascension MMO TUI\n\
+                     \n\
+                     USAGE:\n\
+                       hyaku [OPTIONS] [USERNAME] [SERVER_URL]\n\
+                     \n\
+                     OPTIONS:\n\
+                       -u, --user <NAME>       Player username\n\
+                       -s, --server <URL>      WebSocket server URL (default: Nest cloud server)\n\
+                       -c, --class <0-3>       Class selection (0: Striker, 1: Paladin, 2: Mage, 3: Rogue)\n\
+                       -l, --local             Connect to local development server (ws://127.0.0.1:3000/ws)\n\
+                       -v, --version           Print version information\n\
+                       -h, --help              Print this help message\n\
+                     \n\
+                     CONTROLS:\n\
+                       [WASD] / [Arrows]       Move climber\n\
+                       [Space]                 Attack / Interact\n\
+                       [R]                     Deploy Holo-Decoy (20 Mana, holds pressure plates)\n\
+                       [B] + [WASD]            Build Shard Bridge over Chasm (5 Shards)\n\
+                       [E]                     Deposit Shards at Shrine [百]\n\
+                       [T] / [Enter]           Open Tower Comms (Chat)\n\
+                       [Esc]                   Cancel / Menu\n\
+                       [Q]                     Ascend unlocked stairs\n"
+                );
+                return Ok(());
+            }
+            "--version" | "-v" => {
+                println!("hyaku v{}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            "--local" | "-l" => {
+                server_url = "ws://127.0.0.1:3000/ws".to_string();
+            }
             "--user" | "-u" => {
                 if let Some(val) = args.next() {
                     username = val;
@@ -45,6 +81,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             other => {
                 if other.starts_with("ws://") || other.starts_with("wss://") {
                     server_url = other.to_string();
+                } else if other == "local" || other == "localhost" {
+                    server_url = "ws://127.0.0.1:3000/ws".to_string();
                 } else if let Ok(idx) = other.parse::<usize>() {
                     class_idx = idx;
                 } else {

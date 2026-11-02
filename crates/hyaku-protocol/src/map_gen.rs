@@ -46,7 +46,7 @@ pub const SANCTUARY_LOBBY_ASCII: &str = "\
 #...#...#.......#...........~.......~......~.......~...........#.......#...#...#\n\
 #...#...#.......#...#...#...~...=...~......~...=...~...#...#...#.......#...#...#\n\
 #...#...#########...#...#...~...=...~......~...=...~...#...#...#########...#...#\n\
-#...#...............#...#...~~~~=~~~~.._...~~~~=~~~~...#...#...............#...#\n\
+#...#...............#...#...~~~~=~~~~._.._.~~~~=~~~~...#...#...............#...#\n\
 #...#################...################################...#################...#\n\
 ################################################################################";
 
@@ -638,6 +638,11 @@ pub fn generate_procedural_floor(
 
     map.set_tile(plate_pos, Tile::PressurePlate { id: 1, active: false });
     map.plates.push((1, plate_pos));
+
+    // Place second co-op pressure plate for Gate 1 in puzzle room
+    let plate_pos2 = Position::new(room_puzzle.x + 2, room_puzzle.y + room_puzzle.h - 3);
+    map.set_tile(plate_pos2, Tile::PressurePlate { id: 1, active: false });
+    map.plates.push((1, plate_pos2));
 
     // Room 2: Sanctum Shrine of Renewal [百]
     let shrine_pos = room_sanctum.center();
