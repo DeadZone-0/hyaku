@@ -9,7 +9,7 @@
   ╚═╝  ╚═╝   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝
 ```
 
-**Hyaku** is a cooperative multiplayer terminal-based MMO where players scale a mysterious 100-floor tower together in real-time. Navigate procedural floors, solve multi-plate pressure puzzles, build shard bridges across bottomless chasms, battle biome gatekeepers, and unlock ancient shrines to ascend toward the summit.
+**Hyaku** (百) is a cooperative terminal MMO where players climb a 100-floor tower together in real time. Work with other climbers to solve multi-plate puzzles, bridge chasms with gathered shards, fight monsters, and unlock floor shrines to reach the summit.
 
 ---
 
@@ -55,23 +55,23 @@ An authoritative 24/7 game server is hosted on Hack Club Nest:
 | Key | Action | Description |
 | :--- | :--- | :--- |
 | `[W] [A] [S] [D]` / Arrows | **Move** | Move your climber across the grid |
-| `[Space]` | **Interact / Attack** | Strike nearby enemies or interact |
+| `[Space]` | **Directional Slash** | Melee sweep in your facing direction |
+| `[Q]` | **Lightning Tether** | Link with the nearest ally or holo-decoy to shock enemies along the beam |
 | `[R]` | **Holo-Decoy** | Spend 20 Mana to spawn a 15-second hologram that holds down pressure plates |
 | `[B]` + Direction | **Build Bridge** | Spend 5 Shards to permanently bridge an adjacent Chasm (`═`) for all players |
-| `[E]` | **Deposit Shards** | Deposit held Shards into the Floor Shrine (`[百]`) to unlock the Stairs Up |
-| `[T]` / `[Enter]` | **Tower Comms** | Open chat deck to message nearby climbers |
+| `[E]` | **Interact / Shrine** | Deposit shards into the Floor Shrine (`☼`), use stairs, or revive teammates |
+| `[T]` / `[Enter]` | **Tower Comms** | Open chat deck to message climbers on your floor |
 | `[K]` | **Carve Floor** | Carve a permanent message onto the floor tile |
-| `[Q]` | **Ascend** | Climb unlocked stairs to the next floor |
 | `[Esc]` | **Cancel / Back** | Close active prompt or cancel target selection |
 
 ---
 
 ## Hero Classes
 
-1. **Striker (0)**: High HP and physical combat prowess.
-2. **Paladin (1)**: High defense, regenerative aura, and protective shields.
-3. **Mage (2)**: High Mana capacity, projectile magic, and utility spells.
-4. **Rogue (3)**: High agility, swift movement, and stealth decoy tricks.
+1. **Blade (0)**: Frontline vanguard with high HP and sweeping strikes.
+2. **Arcanist (1)**: Tower ether specialist with high mana for tethers and holo-decoys.
+3. **Ranger (2)**: Agile scout equipped with long-range piercing attacks.
+4. **Architect (3)**: Support builder adept at bridging chasms and tower defenses.
 
 ---
 
@@ -105,5 +105,5 @@ cargo test --workspace
 
 - **`crates/hyaku-protocol`**: Deterministic 100-floor world generator, network packet serialization, entity definitions, and coordinate math.
 - **`crates/hyaku-server`**: Authoritative 20-TPS WebSocket server with real-time collision detection, co-op puzzle state, and floor broadcasting.
-- **`crates/hyaku-client`**: High-performance terminal UI rendered via `ratatui` and `crossterm`, featuring a 4-pane command deck, radar minimap, chat log, and speech bubbles.
+- **`crates/hyaku-client`**: Terminal UI rendered via `ratatui` and `crossterm`, featuring a 4-pane command deck, radar minimap, chat log, and speech bubbles.
 - **`.github/workflows/release.yml`**: Automated cross-platform release pipeline for Linux (musl static) and macOS (Intel & Apple Silicon).

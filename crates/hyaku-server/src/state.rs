@@ -165,14 +165,6 @@ impl FloorInstance {
         tiles_override.get(&pos).copied().or_else(|| map.get_tile(pos))
     }
 
-    fn check_walkable(
-        map: &FloorMap,
-        tiles_override: &HashMap<Position, Tile>,
-        pos: Position,
-    ) -> bool {
-        Self::resolve_tile(map, tiles_override, pos).map_or(false, |t| t.is_walkable())
-    }
-
     pub fn add_player(&mut self, player: PlayerState) {
         self.players.insert(player.id.clone(), player);
     }
@@ -389,158 +381,37 @@ impl FloorInstance {
             }
         }
 
-        // Enemy AI every 10 ticks (0.5 sec)
-        if self.tick_counter % 10 == 0 && !self.players.is_empty() {
-            let mut attacks = Vec::new();
+        // 1. Process Enemy AI (Patrol, Chase, Contact Damage)
+        let (ai_projectiles, ai_announcements) = crate::combat::update_enemy_ai(
+            &mut self.enemies,
+            &mut self.players,
+            &self.decoys,
+            &self.map,
+            &self.tiles_override,
+            self.tick_counter,
+        );
+        self.projectiles.extend(ai_projectiles);
+        self.pending_announcements.extend(ai_announcements);
 
-            for enemy in self.enemies.iter_mut() {
-                if !enemy.is_alive() {
-                    continue;
-                }
+        // 2. Periodic Floor Monster Spawning (maintains active floor monsters)
+        crate::combat::spawn_floor_monsters_if_needed(
+            &mut self.enemies,
+            &self.map,
+            &self.tiles_override,
+            self.floor,
+            self.tick_counter,
+            4,
+        );
 
-                // Check active Holo-Decoys first (distraction target)
-                let mut closest_target: Option<Position> = None;
-                let mut min_dist = u32::MAX;
-
-                for decoy in &self.decoys {
-                    let d = enemy.pos.manhattan_distance(decoy.pos);
-                    if d < min_dist && d <= 12 {
-                        min_dist = d;
-                        closest_target = Some(decoy.pos);
-                    }
-                }
-
-                // If no nearby decoy, target nearest alive player
-                if closest_target.is_none() {
-                    for player in self.players.values() {
-                        if !player.is_alive() {
-                            continue;
-                        }
-                        let dist = enemy.pos.manhattan_distance(player.pos);
-                        if dist < min_dist {
-                            min_dist = dist;
-                            closest_target = Some(player.pos);
-                        }
-                    }
-                }
-
-                if let Some(target) = closest_target {
-                    if min_dist == 1 {
-                        let dmg = match enemy.kind {
-                            EnemyKind::Crawler => 8,
-                            EnemyKind::Archer => 12,
-                            EnemyKind::Brute => 22,
-                            EnemyKind::Phantom => 16,
-                            EnemyKind::FloorBoss => 30,
-                        };
-                        attacks.push((target, dmg));
-                    } else if enemy.kind == EnemyKind::Archer && min_dist >= 2 && min_dist <= 5 {
-                        attacks.push((target, 12));
-                        self.projectiles.push((
-                            ProjectileState::new(target, '*', (140, 200, 80)),
-                            2,
-                        ));
-                    } else if min_dist <= 12 {
-                        // Move one step toward target
-                        if let Some(step_dir) = enemy.pos.direction_to(target) {
-                            let next_pos = enemy.pos.step(step_dir);
-                            if Self::check_walkable(&self.map, &self.tiles_override, next_pos) {
-                                enemy.pos = next_pos;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Apply queued enemy attack damage
-            for (target_pos, dmg) in attacks {
-                self.projectiles.push((
-                    ProjectileState::new(target_pos, '!', (255, 60, 60)),
-                    2,
-                ));
-                for player in self.players.values_mut() {
-                    if player.is_alive() && player.pos == target_pos {
-                        player.take_damage(dmg);
-                        println!(
-                            "[HYAKU COMBAT] Enemy struck '{}' at ({}, {}) for {} DMG! HP: {}/{}",
-                            player.username, target_pos.x, target_pos.y, dmg, player.hp, player.max_hp
-                        );
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Lightning Tether electrical arc damage and energetic spark particles
-        if self.tick_counter % 2 == 0 {
-            let mut processed_pairs: HashSet<(String, String)> = HashSet::new();
-            let mut tether_events = Vec::new();
-
-            let player_tethers: Vec<(String, String, Position, String)> = self
-                .players
-                .values()
-                .filter(|p| p.is_alive() && p.tether_target.is_some())
-                .map(|p| (p.id.clone(), p.tether_target.clone().unwrap(), p.pos, p.username.clone()))
-                .collect();
-
-            for (p1_id, target_id, p1_pos, p1_name) in player_tethers {
-                let pair_key = if p1_id < target_id {
-                    (p1_id.clone(), target_id.clone())
-                } else {
-                    (target_id.clone(), p1_id.clone())
-                };
-
-                if processed_pairs.contains(&pair_key) {
-                    continue;
-                }
-                processed_pairs.insert(pair_key);
-
-                if let Some(target_player) = self.players.get(&target_id) {
-                    if target_player.is_alive() && p1_pos.manhattan_distance(target_player.pos) <= 14 {
-                        let target_pos = target_player.pos;
-                        let target_name = target_player.username.clone();
-                        let line_points = p1_pos.line_to(target_pos);
-
-                        for pt in line_points {
-                            if pt == p1_pos || pt == target_pos {
-                                continue;
-                            }
-                            // Spawn energetic spark particle along tether beam
-                            self.projectiles.push((
-                                ProjectileState::new(pt, '⚡', (120, 240, 255)),
-                                1,
-                            ));
-
-                            // Electrocute enemies intersecting the beam
-                            for enemy in self.enemies.iter_mut() {
-                                if enemy.is_alive() && enemy.pos == pt {
-                                    enemy.take_damage(8);
-                                    let dead = !enemy.is_alive();
-                                    if dead {
-                                        let enemy_name = enemy.kind.name();
-                                        tether_events.push((
-                                            p1_id.clone(),
-                                            target_id.clone(),
-                                            format!(":: TETHER DISCHARGE :: @{} and @{} electrocuted {}!", p1_name, target_name, enemy_name),
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            for (p1_id, p2_id, event) in tether_events {
-                self.pending_announcements.push(event);
-                if let Some(p1) = self.players.get_mut(&p1_id) {
-                    p1.shards += 2;
-                }
-                if let Some(p2) = self.players.get_mut(&p2_id) {
-                    p2.shards += 2;
-                }
-            }
-        }
+        // 3. Process Co-op Lightning Tether Continuous Electric Damage (each tick)
+        let tether_result = crate::combat::process_continuous_tether_tick(
+            &mut self.players,
+            &self.decoys,
+            &mut self.enemies,
+            self.tick_counter,
+        );
+        self.projectiles.extend(tether_result.spark_projectiles);
+        self.pending_announcements.extend(tether_result.announcements);
 
         // Projectile decay (lasts specified TTL ticks)
         self.projectiles.retain_mut(|(proj, ttl)| {
@@ -721,60 +592,23 @@ impl ServerState {
                         });
 
                         if let Some((class_idx, player_name, start_pos)) = player_info {
-                            let class_preset = hyaku_protocol::get_class_preset(class_idx);
-                            let base_dmg = class_preset.attack_power;
+                            let slash_res = crate::combat::execute_directional_slash(
+                                start_pos,
+                                &player_name,
+                                dir,
+                                class_idx,
+                                floor.map.width,
+                                floor.map.height,
+                                &mut floor.enemies,
+                                floor.tick_counter,
+                            );
 
-                            let (max_reach, crit_chance, slash_glyph) = match class_idx {
-                                1 => (3, 25, '*'),
-                                2 => (4, 35, dir.arrow_glyph()),
-                                _ => (
-                                    1,
-                                    20,
-                                    match dir {
-                                        Direction::Up | Direction::Down => '|',
-                                        Direction::Left | Direction::Right => '-',
-                                    },
-                                ),
-                            };
+                            floor.projectiles.extend(slash_res.slash_projectiles);
+                            announcements.extend(slash_res.announcements);
 
-                            let mut target_positions = Vec::new();
-                            let mut current = start_pos;
-                            let mut shards_earned = 0;
-
-                            for _ in 1..=max_reach {
-                                current = current.step(dir);
-                                if !current.in_bounds(floor.map.width, floor.map.height) {
-                                    break;
-                                }
-                                target_positions.push(current);
-
-                                if let Some((_dmg, _crit, shards, events)) = floor.hit_enemy_at(
-                                    current,
-                                    base_dmg,
-                                    crit_chance,
-                                    Some(dir),
-                                    &player_name,
-                                ) {
-                                    shards_earned += shards;
-                                    announcements.extend(events);
-                                    break;
-                                }
-
-                                if !floor.is_walkable(current) {
-                                    break;
-                                }
-                            }
-
-                            for &pos in &target_positions {
-                                floor.projectiles.push((
-                                    ProjectileState::new(pos, slash_glyph, class_preset.color_rgb),
-                                    3,
-                                ));
-                            }
-
-                            if shards_earned > 0 {
+                            if slash_res.shards_dropped > 0 {
                                 if let Some(p) = floor.players.get_mut(player_id) {
-                                    p.shards += shards_earned;
+                                    p.shards += slash_res.shards_dropped;
                                 }
                             }
                         }
@@ -1026,8 +860,12 @@ impl ServerState {
                             } else {
                                 player.tether_target = target_id.clone();
                                 if let Some(ref tid) = target_id {
-                                    let target_name = floor.players.get(tid).map(|p| p.username.clone()).unwrap_or_else(|| "Ally".to_string());
-                                    tether_msg = Some(format!("* [CO-OP] @{} forged an Aetheric Lightning Tether with @{}! Electric arcing connects you! *", my_name, target_name));
+                                    let target_name = if tid.starts_with("decoy-") {
+                                        "Holo-Decoy §".to_string()
+                                    } else {
+                                        floor.players.get(tid).map(|p| p.username.clone()).unwrap_or_else(|| "Ally".to_string())
+                                    };
+                                    tether_msg = Some(format!("* [CO-OP] @{} forged an Aetheric Lightning Tether with {}! Electric arcing connects you! *", my_name, target_name));
                                 }
                             }
                         }
@@ -1413,7 +1251,7 @@ impl ServerState {
                                     rejection_msg = Some(":: ASCENSION SEALED :: The gate to the stairs is locked! Unlock it via the Pressure Plate or by slaying the Floor Guardian!".to_string());
                                 } else if !floor.stairs_unlocked {
                                     rejection_msg = Some(format!(
-                                        ":: SHRINE SEALED :: The Stairs are sealed until the Shrine [百] offering is fulfilled ({}/{} Shards)!",
+                                        ":: SHRINE SEALED :: Gate is OPEN, but Stairs are sealed until the Shrine [百] offering is fulfilled ({}/{} Shards)! Offer shards at the Shrine [百]!",
                                         floor.shrine_shards, floor.shrine_goal
                                     ));
                                 } else {
@@ -1937,10 +1775,10 @@ mod tests {
 
         // Crawler has 30 HP, takes 8 DMG -> HP = 22
         let enemy = f.enemies.iter().find(|e| e.id == 99).unwrap();
-        assert_eq!(enemy.hp, 22, "Enemy intersected by tether must take damage");
+        assert_eq!(enemy.hp, 18, "Enemy intersected by tether must take damage");
 
         // Verify spark projectile exists on the line
-        assert!(f.projectiles.iter().any(|(p, _)| p.pos == Position::new(12, 10) && p.glyph == '⚡'));
+        assert!(f.projectiles.iter().any(|(p, _)| p.pos == Position::new(12, 10) && matches!(p.glyph, '↯' | '⠶' | '*')));
     }
 
     #[test]

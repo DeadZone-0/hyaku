@@ -512,6 +512,31 @@ fn render_top_status_bar(frame: &mut Frame, app: &AppState, area: Rect) {
             ("?", 0)
         };
 
+    let (shrine_compass, shrine_dist) =
+        if let (Some(me), Some(map)) = (app.my_player(), &app.current_map) {
+            if let Some(spos) = map.shrine_pos {
+                let dx = spos.x - me.pos.x;
+                let dy = spos.y - me.pos.y;
+                let dist = me.pos.manhattan_distance(spos);
+                let arrow = match (dx.signum(), dy.signum()) {
+                    (0, -1) => "↑",
+                    (0, 1) => "↓",
+                    (-1, 0) => "←",
+                    (1, 0) => "→",
+                    (1, -1) => "↗",
+                    (1, 1) => "↘",
+                    (-1, -1) => "↖",
+                    (-1, 1) => "↙",
+                    _ => "* HERE",
+                };
+                (arrow, dist)
+            } else {
+                ("?", 0)
+            }
+        } else {
+            ("?", 0)
+        };
+
     let is_gate_locked = app.current_map.as_ref().map_or(false, |map| {
         if map.gates.is_empty() {
             return false;
@@ -575,7 +600,7 @@ fn render_top_status_bar(frame: &mut Frame, app: &AppState, area: Rect) {
     let gauge_label = if shrine_goal == 0 || stairs_unlocked {
         format!("Shrine [百]: UNLOCKED ({}/{} Shards)", shrine_cur, shrine_goal)
     } else {
-        format!("Shrine [百]: {}/{} Shards (Bank: {})", shrine_cur, shrine_goal, tower_bank)
+        format!("Shrine [百]: {}/{} [{} {}m] (Bank: {})", shrine_cur, shrine_goal, shrine_compass, shrine_dist, tower_bank)
     };
     let shrine_gauge = Gauge::default()
         .gauge_style(
@@ -624,7 +649,12 @@ fn render_top_status_bar(frame: &mut Frame, app: &AppState, area: Rect) {
             )
         },
         Span::styled(
-            format!("[{} {}m]", stairs_compass, stairs_dist),
+            if !stairs_unlocked && !is_gate_locked {
+                // Gate is opened, guide player directly to the Shrine to unseal the stairs!
+                format!("Shrine:[{} {}m]", shrine_compass, shrine_dist)
+            } else {
+                format!("Stairs:[{} {}m]", stairs_compass, stairs_dist)
+            },
             Style::default().fg(Color::Rgb(80, 255, 180)),
         ),
     ]);
@@ -632,6 +662,32 @@ fn render_top_status_bar(frame: &mut Frame, app: &AppState, area: Rect) {
         Paragraph::new(status_line).alignment(Alignment::Right),
         cols[2],
     );
+}
+
+/// Bresenham's integer line algorithm to draw the Co-op Lightning Tether between climbers
+pub fn bresenham_line(start: Position, end: Position) -> Vec<Position> {
+    let mut points = Vec::new();
+    let dx = (end.x - start.x).abs();
+    let dy = (end.y - start.y).abs();
+    let sx = if start.x < end.x { 1 } else { -1 };
+    let sy = if start.y < end.y { 1 } else { -1 };
+    let mut err = dx - dy;
+
+    let mut cur = start;
+    while cur != end {
+        points.push(cur);
+        let e2 = 2 * err;
+        if e2 > -dy {
+            err -= dy;
+            cur.x += sx;
+        }
+        if e2 < dx {
+            err += dx;
+            cur.y += sy;
+        }
+    }
+    points.push(end);
+    points
 }
 
 // -------------------------------------------------------------------------
@@ -864,22 +920,44 @@ fn render_camera_viewport(frame: &mut Frame, app: &mut AppState, area: Rect) {
             }
         }
 
-        // 4. Render projectiles (attack slashes, arrows, ether bolts)
-        for proj in &tick.projectiles {
+        // 4. Render projectiles (directional melee slash arcs, arrows, aether shards, ether bolts)
+        // Sort so slash arcs ('╱', '─', '│', '╲') render with priority over ground shard particles
+        let mut sorted_projs: Vec<_> = tick.projectiles.iter().collect();
+        sorted_projs.sort_by_key(|p| match p.glyph {
+            '╱' | '│' | '╲' | '─' => 1,
+            _ => 0,
+        });
+
+        for proj in sorted_projs {
             let (sx, sy) = app.world_to_screen(proj.pos);
             if sx >= 0 && sx < inner_w && sy >= 0 && sy < inner_h {
-                let bg_rgb = (
-                    (proj.color_rgb.0 / 4).max(15),
-                    (proj.color_rgb.1 / 4).max(15),
-                    (proj.color_rgb.2 / 4).max(15),
-                );
+                let cell_bg = grid[sy as usize][sx as usize].1.bg.unwrap_or(Color::Rgb(20, 24, 32));
+                let (fg_color, bg_color) = match proj.glyph {
+                    '╱' | '│' | '╲' | '─' => (
+                        Color::Rgb(
+                            proj.color_rgb.0.saturating_add(60),
+                            proj.color_rgb.1.saturating_add(60),
+                            proj.color_rgb.2.saturating_add(60),
+                        ),
+                        cell_bg, // Clean native floor tile background! No muddy brown box
+                    ),
+                    '*' => (
+                        Color::Rgb(255, 220, 40), // Dropped Aether Shards
+                        cell_bg,
+                    ),
+                    '↯' | '⚡' => (
+                        Color::Rgb(120, 240, 255), // Lightning sparks
+                        cell_bg,
+                    ),
+                    _ => (
+                        Color::Rgb(proj.color_rgb.0, proj.color_rgb.1, proj.color_rgb.2),
+                        cell_bg,
+                    ),
+                };
+
                 let style = Style::default()
-                    .fg(Color::Rgb(
-                        proj.color_rgb.0,
-                        proj.color_rgb.1,
-                        proj.color_rgb.2,
-                    ))
-                    .bg(Color::Rgb(bg_rgb.0, bg_rgb.1, bg_rgb.2))
+                    .fg(fg_color)
+                    .bg(bg_color)
                     .add_modifier(Modifier::BOLD);
                 grid[sy as usize][sx as usize] = (proj.glyph, style);
             }
@@ -971,17 +1049,26 @@ fn render_camera_viewport(frame: &mut Frame, app: &mut AppState, area: Rect) {
                 }
                 rendered_tethers.insert(pair_key);
 
-                if let Some(target) = tick.players.iter().find(|t| t.id == *target_id) {
-                    if p.is_alive() && target.is_alive() {
-                        let line_points = p.pos.line_to(target.pos);
+                let target_pos_opt = if let Some(target) = tick.players.iter().find(|t| t.id == *target_id) {
+                    if target.is_alive() { Some(target.pos) } else { None }
+                } else if target_id.starts_with("decoy-") {
+                    let decoy_id = target_id.trim_start_matches("decoy-").parse::<u64>().ok();
+                    tick.decoys.iter().find(|d| Some(d.id) == decoy_id).map(|d| d.pos)
+                } else {
+                    None
+                };
+
+                if let Some(target_pos) = target_pos_opt {
+                    if p.is_alive() && p.pos.manhattan_distance(target_pos) <= 8 {
+                        let line_points = bresenham_line(p.pos, target_pos);
                         for (idx, pt) in line_points.iter().enumerate() {
-                            if *pt == p.pos || *pt == target.pos {
+                            if *pt == p.pos || *pt == target_pos {
                                 continue;
                             }
                             let (sx, sy) = app.world_to_screen(*pt);
                             if sx >= 0 && sx < inner_w && sy >= 0 && sy < inner_h {
                                 let spark_glyph = match (tick_counter + idx as u64) % 3 {
-                                    0 => '⚡',
+                                    0 => '↯',
                                     1 => '⠶',
                                     _ => '~',
                                 };
@@ -1384,7 +1471,7 @@ fn tile_to_glyph_and_style(
                 Color::Rgb(180, 255, 255)
             };
             (
-                '百',
+                '☼',
                 Style::default()
                     .fg(glow)
                     .bg(Color::Rgb(18, 55, 75))
@@ -1490,7 +1577,7 @@ fn render_radar_minimap(frame: &mut Frame, app: &AppState, area: Rect) {
                         Tile::Chasm => (' ', Style::default().bg(Color::Black)),
                         Tile::Bridge => ('═', Style::default().fg(Color::Rgb(180, 120, 60))),
                         Tile::Shrine => (
-                            '百',
+                            '☼',
                             Style::default()
                                 .fg(Color::Rgb(80, 240, 255))
                                 .add_modifier(Modifier::BOLD),
@@ -1864,13 +1951,11 @@ fn render_bottom_hud(frame: &mut Frame, app: &AppState, area: Rect) {
         Span::styled("[WASD]", Style::default().fg(TITLE_COLOR_ACCENT)),
         Span::raw(" Move | "),
         Span::styled("[Space]", Style::default().fg(TITLE_COLOR_ACCENT)),
-        Span::raw(" Strike | "),
-        Span::styled("[Q]", Style::default().fg(Color::Cyan)),
-        Span::raw(" Power | "),
+        Span::raw(" Slash Sweep | "),
+        Span::styled("[Q]", Style::default().fg(Color::Rgb(120, 240, 255)).add_modifier(Modifier::BOLD)),
+        Span::raw(" Tether ↯ (Ally/Decoy ≤8m) | "),
         Span::styled("[R]", Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD)),
         Span::raw(" Decoy | "),
-        Span::styled("[T]", Style::default().fg(Color::Rgb(120, 240, 255)).add_modifier(Modifier::BOLD)),
-        Span::raw(" Tether ⚡ | "),
         Span::styled("[B]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
         Span::raw(" Bridge (5S) | "),
         Span::styled("[E]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),

@@ -23,12 +23,12 @@ jobs:
             target: x86_64-unknown-linux-musl
             use_cross: false
             archive_suffix: tar.gz
-          - os: macos-13
-            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
             use_cross: false
             archive_suffix: tar.gz
           - os: macos-latest
-            target: aarch64-apple-darwin
+            target: x86_64-apple-darwin
             use_cross: false
             archive_suffix: tar.gz
 
@@ -150,7 +150,8 @@ jobs:
         with:
           tag_name: ${{ steps.prep.outputs.tag_name }}
           name: ${{ steps.prep.outputs.is_tag == 'true' && format('Hyaku {0}', steps.prep.outputs.tag_name) || 'Hyaku Rolling Release (Latest)' }}
-          prerelease: ${{ steps.prep.outputs.is_tag != 'true' }}
+          prerelease: false
+          make_latest: true
           draft: false
           generate_release_notes: true
           files: release_assets/*

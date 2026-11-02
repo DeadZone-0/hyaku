@@ -400,22 +400,61 @@ impl AppState {
                 self.should_quit = true;
             }
             KeyCode::Char('q') | KeyCode::Char('Q') => {
-                let skill_name = match self.class_idx {
-                    0 => "Iai: Eightfold Bloom",
-                    1 => "Aether Rupture: Singularity",
-                    2 => "Phantom Rain: Eclipse Volley",
-                    _ => "Titan's Cataclysm: Faultline",
+                let (target_opt, is_already_tethered) = if let (Some(me), Some(tick)) = (self.my_player(), &self.tick_state) {
+                    let cur_tether = me.tether_target.clone();
+                    if cur_tether.is_some() {
+                        (cur_tether, true)
+                    } else {
+                        // 1. Find closest alive teammate within 8 tiles
+                        let closest_ally = tick.players
+                            .iter()
+                            .filter(|p| p.id != me.id && p.is_alive() && me.pos.manhattan_distance(p.pos) <= 8)
+                            .min_by_key(|p| me.pos.manhattan_distance(p.pos))
+                            .map(|p| (p.id.clone(), p.username.clone()));
+
+                        // 2. Or fallback to closest Holo-Decoy within 8 tiles (allows solo testing)
+                        let closest = closest_ally.or_else(|| {
+                            tick.decoys
+                                .iter()
+                                .filter(|d| me.pos.manhattan_distance(d.pos) <= 8)
+                                .min_by_key(|d| me.pos.manhattan_distance(d.pos))
+                                .map(|d| (format!("decoy-{}", d.id), "Holo-Decoy §".to_string()))
+                        });
+
+                        (closest.map(|(id, _)| id), false)
+                    }
+                } else {
+                    (None, false)
                 };
-                self.announcement = Some(format!("Unleashing Power: {}!", skill_name));
-                self.screen_flash = Some((Color::Cyan, 4));
-                if let Some(me) = self.my_player() {
-                    self.spawn_floating_text(
-                        Position::new(me.pos.x, me.pos.y.saturating_sub(1)),
-                        skill_name.to_string(),
-                        Color::LightMagenta,
-                    );
+
+                if is_already_tethered {
+                    self.announcement = Some("Severing Aetheric Lightning Tether...".to_string());
+                    self.queue_packet(ClientPacket::ToggleTether { target_id: None });
+                } else if let Some(target_id) = target_opt {
+                    let target_name = if target_id.starts_with("decoy-") {
+                        "Holo-Decoy §".to_string()
+                    } else {
+                        self.tick_state.as_ref().and_then(|t| t.players.iter().find(|p| p.id == target_id).map(|p| p.username.clone())).unwrap_or_else(|| "Ally".to_string())
+                    };
+                    if let Some(me) = self.my_player() {
+                        self.spawn_floating_text(
+                            me.pos,
+                            format!("* TETHER: @{} ↯ *", target_name),
+                            Color::Rgb(120, 240, 255),
+                        );
+                    }
+                    self.announcement = Some(format!("Forging Lightning Tether with {} (≤8 tiles)! Beam active!", target_name));
+                    self.queue_packet(ClientPacket::ToggleTether { target_id: Some(target_id) });
+                } else {
+                    if let Some(me) = self.my_player() {
+                        self.spawn_floating_text(
+                            me.pos,
+                            "* [Q] REQUIRES ALLY OR DECOY (≤8m) *".to_string(),
+                            Color::Rgb(255, 100, 100),
+                        );
+                    }
+                    self.announcement = Some("No teammate or Holo-Decoy within 8 tiles! Stand near an ally or press [R] to drop a Decoy!".to_string());
                 }
-                self.queue_packet(ClientPacket::ClassSkill(self.last_dir));
             }
             KeyCode::Enter => {
                 self.input_mode = InputMode::Chatting;
@@ -701,7 +740,7 @@ impl AppState {
                             .map(|t| (t.shrine_shards, t.shrine_goal))
                             .unwrap_or((0, 0));
                         self.announcement = Some(format!(
-                            "The Stairs are sealed until the Shrine [百] offering is fulfilled ({}/{} Shards)! Offer shards at the Shrine [百]!",
+                            "Gate is OPEN, but Stairs need Shrine [百] offering ({}/{} Shards)! Slay monsters for shards and deposit them at Shrine [百]!",
                             cur, goal
                         ));
                     } else {
@@ -831,10 +870,30 @@ impl AppState {
                         let front = me.pos.step(self.last_dir);
                         self.spawn_floating_text(front, "*CRIT!*".to_string(), Color::Rgb(255, 230, 40));
                     }
-                } else if text.contains("Enemy struck") {
+                } else if text.contains("MELEE SWEEP") || text.contains("sliced") {
+                    self.screen_flash = Some((Color::White, 2));
+                    if let Some(me) = self.my_player() {
+                        let front = me.pos.step(self.last_dir);
+                        let dmg_str = if let Some(idx) = text.find("for ") {
+                            let rest = &text[idx + 4..];
+                            let num = rest.split_whitespace().next().unwrap_or("");
+                            format!("-{} DMG", num)
+                        } else {
+                            "*HIT*".to_string()
+                        };
+                        self.spawn_floating_text(front, dmg_str, Color::Rgb(255, 220, 60));
+                    }
+                } else if text.contains("CONTACT DAMAGE") || text.contains("struck") {
                     self.screen_flash = Some((Color::Red, 4));
                     if let Some(me) = self.my_player() {
-                        self.spawn_floating_text(me.pos, "-HURT-".to_string(), Color::Red);
+                        let dmg_str = if let Some(idx) = text.find("for ") {
+                            let rest = &text[idx + 4..];
+                            let num = rest.split_whitespace().next().unwrap_or("8");
+                            format!("-{} HP", num)
+                        } else {
+                            "-HURT-".to_string()
+                        };
+                        self.spawn_floating_text(me.pos, dmg_str, Color::Rgb(255, 60, 60));
                     }
                 }
             }
@@ -1072,13 +1131,18 @@ mod tests {
         }
         assert!(app.server_banner.is_none(), "ServerBanner must expire after its TTL");
 
-        // 5. Test [T] key: Toggles Lightning Tether with closest ally
+        // 5. Test [Q] key (Stage 7 Co-op Lightning Tether within 8 tiles)
         let mut ally = PlayerState::new("p-2".to_string(), "Ally".to_string(), 1, Position::new(22, 20), 1);
         if let Some(ref mut ts) = app.tick_state {
             ts.players.push(ally.clone());
         }
-        app.handle_key(KeyCode::Char('t'));
+        app.handle_key(KeyCode::Char('q'));
         assert_eq!(app.pop_outbound_packet(), Some(ClientPacket::ToggleTether { target_id: Some("p-2".to_string()) }));
+
+        // 5b. Test [Space] key: Directional Slash sweep
+        app.last_dir = Direction::Up;
+        app.handle_key(KeyCode::Char(' '));
+        assert_eq!(app.pop_outbound_packet(), Some(ClientPacket::Attack(Direction::Up)));
 
         // 6. Test [E] key near fallen ally: Resurrects comrade
         ally.hp = 0;
