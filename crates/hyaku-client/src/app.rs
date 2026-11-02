@@ -434,6 +434,70 @@ impl AppState {
                     );
                 }
             }
+            KeyCode::Char('1') => {
+                let callout = "Step on the Pressure Plate [o]!".to_string();
+                self.speech_bubbles.insert(
+                    self.username.clone(),
+                    SpeechBubble {
+                        text: callout.clone(),
+                        ttl: 200,
+                    },
+                );
+                self.queue_packet(ClientPacket::Chat { text: callout });
+                if let Some(me) = self.my_player() {
+                    self.spawn_floating_text(me.pos, "* PING: PLATE [o] *".to_string(), Color::Yellow);
+                }
+            }
+            KeyCode::Char('2') => {
+                let callout = "Gather at the Tower Shrine [百]!".to_string();
+                self.speech_bubbles.insert(
+                    self.username.clone(),
+                    SpeechBubble {
+                        text: callout.clone(),
+                        ttl: 200,
+                    },
+                );
+                self.queue_packet(ClientPacket::Chat { text: callout });
+                if let Some(me) = self.my_player() {
+                    self.spawn_floating_text(me.pos, "* PING: SHRINE [百] *".to_string(), Color::Cyan);
+                }
+            }
+            KeyCode::Char('3') => {
+                let callout = "Rest by the Campfire [*] to heal!".to_string();
+                self.speech_bubbles.insert(
+                    self.username.clone(),
+                    SpeechBubble {
+                        text: callout.clone(),
+                        ttl: 200,
+                    },
+                );
+                self.queue_packet(ClientPacket::Chat { text: callout });
+                if let Some(me) = self.my_player() {
+                    self.spawn_floating_text(
+                        me.pos,
+                        "* PING: CAMPFIRE [*] *".to_string(),
+                        Color::Rgb(255, 160, 40),
+                    );
+                }
+            }
+            KeyCode::Char('4') => {
+                let callout = "Praise the Hundred Shards! [百] Let's ascend!".to_string();
+                self.speech_bubbles.insert(
+                    self.username.clone(),
+                    SpeechBubble {
+                        text: callout.clone(),
+                        ttl: 200,
+                    },
+                );
+                self.queue_packet(ClientPacket::Chat { text: callout });
+                if let Some(me) = self.my_player() {
+                    self.spawn_floating_text(
+                        me.pos,
+                        "* PRAISE [百] *".to_string(),
+                        Color::LightMagenta,
+                    );
+                }
+            }
             KeyCode::Up | KeyCode::Char('w') | KeyCode::Char('k') => {
                 self.last_dir = Direction::Up;
                 self.queue_packet(ClientPacket::Move(Direction::Up));

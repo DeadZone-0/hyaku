@@ -34,12 +34,12 @@ impl FloorInstance {
 
         Self {
             floor,
-            map,
+            map: map.clone(),
             players: HashMap::new(),
             enemies,
             projectiles: Vec::new(),
             tiles_override,
-            carvings: Vec::new(),
+            carvings: map.initial_carvings.clone(),
             tick_counter: 0,
             player_campfires: HashMap::new(),
         }
@@ -77,28 +77,39 @@ impl FloorInstance {
         self.players.remove(player_id)
     }
 
+    #[allow(dead_code)]
     pub fn move_player(&mut self, player_id: &str, dir: Direction) -> bool {
-        let (current_pos, is_alive) = match self.players.get(player_id) {
-            Some(p) => (p.pos, p.is_alive()),
-            None => return false,
+        self.move_player_with_events(player_id, dir).0
+    }
+
+    pub fn move_player_with_events(
+        &mut self,
+        player_id: &str,
+        dir: Direction,
+    ) -> (bool, Option<String>) {
+        let (current_pos, is_alive, username) = match self.players.get(player_id) {
+            Some(p) => (p.pos, p.is_alive(), p.username.clone()),
+            None => return (false, None),
         };
 
         if !is_alive {
-            return false;
+            return (false, None);
         }
 
         let target_pos = current_pos.step(dir);
         if !target_pos.in_bounds(self.map.width, self.map.height) {
-            return false;
+            return (false, None);
         }
 
         if !self.is_walkable(target_pos) {
-            return false;
+            return (false, None);
         }
 
         if let Some(player) = self.players.get_mut(player_id) {
             player.pos = target_pos;
         }
+
+        let mut event = None;
 
         // Check if stepped on a pressure plate
         if let Some(Tile::PressurePlate { id, active }) = self.get_effective_tile(target_pos) {
@@ -113,10 +124,15 @@ impl FloorInstance {
                             .insert(gate_pos, Tile::Gate { id: gate_id, open: true });
                     }
                 }
+
+                event = Some(format!(
+                    "* [CO-OP] @{} stepped on Pressure Plate #{}! The Ascension Gate is UNSEALED! *",
+                    username, id
+                ));
             }
         }
 
-        true
+        (true, event)
     }
 
     pub fn hit_enemy_at(
@@ -490,7 +506,13 @@ impl ServerState {
             ClientPacket::Move(dir) => {
                 if let Some(&floor_num) = self.client_floors.get(player_id) {
                     if let Some(floor) = self.floors.get_mut(&floor_num) {
-                        floor.move_player(player_id, dir);
+                        let (_moved, event) = floor.move_player_with_events(player_id, dir);
+                        if let Some(announcement) = event {
+                            self.broadcast_to_floor(
+                                floor_num,
+                                ServerPacket::Announcement { text: announcement },
+                            );
+                        }
                     }
                 }
             }
@@ -964,11 +986,15 @@ impl ServerState {
                                     "[HYAKU ACTION] Player '{}' lit a resting campfire at ({}, {})",
                                     username, pos.x, pos.y
                                 );
-                                if let Some(tx) = self.clients.get(player_id) {
-                                    let _ = tx.send(ServerPacket::Announcement {
-                                        text: "Lit resting Campfire! (Regenerates HP/MP, max 1 active)".to_string(),
-                                    });
-                                }
+                                self.broadcast_to_floor(
+                                    floor_num,
+                                    ServerPacket::Announcement {
+                                        text: format!(
+                                            "* [CO-OP] @{} kindled a resting Campfire! Rest nearby to recover HP and Mana! *",
+                                            username
+                                        ),
+                                    },
+                                );
                             } else {
                                 if let Some(tx) = self.clients.get(player_id) {
                                     let _ = tx.send(ServerPacket::Announcement {

@@ -740,18 +740,44 @@ fn render_camera_viewport(frame: &mut Frame, app: &mut AppState, area: Rect) {
         for carving in &tick.carvings {
             let (sx, sy) = app.world_to_screen(carving.pos);
             if sx >= 0 && sx < inner_w && sy >= 0 && sy < inner_h {
-                let pulse_fg = if (tick_counter / 3) % 2 == 0 {
-                    Color::Rgb(255, 230, 80)
-                } else {
-                    Color::Rgb(255, 180, 40)
-                };
-                grid[sy as usize][sx as usize] = (
-                    '?',
-                    Style::default()
-                        .fg(pulse_fg)
-                        .bg(Color::Rgb(45, 35, 10))
-                        .add_modifier(Modifier::BOLD),
-                );
+                // Ensure carvings never cover mechanical interactive tiles (plates, campfires, shrines, gates, stairs)
+                let is_interactive = tick.tiles_override.iter().any(|(p, t)| {
+                    *p == carving.pos
+                        && matches!(
+                            t,
+                            Tile::PressurePlate { .. }
+                                | Tile::Gate { .. }
+                                | Tile::Shrine
+                                | Tile::Campfire
+                                | Tile::StairsUp
+                        )
+                }) || app.current_map.as_ref().map_or(false, |m| {
+                    m.get_tile(carving.pos).map_or(false, |t| {
+                        matches!(
+                            t,
+                            Tile::PressurePlate { .. }
+                                | Tile::Gate { .. }
+                                | Tile::Shrine
+                                | Tile::Campfire
+                                | Tile::StairsUp
+                        )
+                    })
+                });
+
+                if !is_interactive {
+                    let pulse_fg = if (tick_counter / 3) % 2 == 0 {
+                        Color::Rgb(255, 230, 80)
+                    } else {
+                        Color::Rgb(255, 180, 40)
+                    };
+                    grid[sy as usize][sx as usize] = (
+                        '?',
+                        Style::default()
+                            .fg(pulse_fg)
+                            .bg(Color::Rgb(45, 35, 10))
+                            .add_modifier(Modifier::BOLD),
+                    );
+                }
 
                 let is_near = app
                     .my_player()
@@ -838,6 +864,7 @@ fn render_camera_viewport(frame: &mut Frame, app: &mut AppState, area: Rect) {
         // 6. Render other players & local player with @username tags and temporary speech bubbles
         for player in &tick.players {
             let (sx, sy) = app.world_to_screen(player.pos);
+            let is_me = app.my_player_id.as_deref() == Some(&player.id);
             if sx >= 0 && sx < inner_w && sy >= 0 && sy < inner_h {
                 if !player.is_alive() {
                     grid[sy as usize][sx as usize] = (
@@ -850,7 +877,6 @@ fn render_camera_viewport(frame: &mut Frame, app: &mut AppState, area: Rect) {
                     continue;
                 }
 
-                let is_me = app.my_player_id.as_deref() == Some(&player.id);
                 let color = Color::Rgb(player.color_rgb.0, player.color_rgb.1, player.color_rgb.2);
 
                 let style = if is_me {
@@ -910,6 +936,28 @@ fn render_camera_viewport(frame: &mut Frame, app: &mut AppState, area: Rect) {
                         }
                     }
                 }
+            } else if !is_me && player.is_alive() {
+                // Off-screen teammate compass: show direction arrow along the edge of the viewport
+                let edge_x = sx.clamp(0, inner_w - 1) as usize;
+                let edge_y = sy.clamp(0, inner_h - 1) as usize;
+                let arrow_ch = if sx < 0 {
+                    '◄'
+                } else if sx >= inner_w {
+                    '►'
+                } else if sy < 0 {
+                    '▲'
+                } else {
+                    '▼'
+                };
+                let arrow_style = Style::default()
+                    .fg(if (tick_counter / 3) % 2 == 0 {
+                        Color::Rgb(80, 240, 255)
+                    } else {
+                        Color::Cyan
+                    })
+                    .bg(Color::Rgb(15, 30, 45))
+                    .add_modifier(Modifier::BOLD);
+                grid[edge_y][edge_x] = (arrow_ch, arrow_style);
             }
         }
 
@@ -1659,6 +1707,8 @@ fn render_bottom_hud(frame: &mut Frame, app: &AppState, area: Rect) {
     }
 
     hint_spans.extend(vec![
+        Span::styled("[1-4]", Style::default().fg(Color::Rgb(80, 240, 255))),
+        Span::raw(" Callouts | "),
         Span::styled("[B]", Style::default().fg(Color::Yellow)),
         Span::raw(" Bridge | "),
         Span::styled("[C]", Style::default().fg(Color::Rgb(255, 140, 40))),
