@@ -151,45 +151,60 @@ async fn run_app(
             _ => {}
         }
 
-        // 2. Pump network messages
+        // 2. Pump inbound server packets
         if let Some(net) = &mut network_opt {
-            // Receive inbound server packets
             while let Some(server_packet) = net.try_recv() {
                 app.handle_server_packet(server_packet);
             }
 
-            // Flush outbound client packets
-            while let Some(client_packet) = app.pop_outbound_packet() {
-                net.send(client_packet);
-            }
-
-            // Detect disconnects during gameplay
             if app.screen == Screen::Connected && !net.is_connected() {
                 app.screen = Screen::Disconnected;
                 network_opt = None;
             }
         }
 
-        // 3. Update active visual effects & render frame
-        app.tick_effects();
-        terminal.draw(|f| ui::render(f, &mut app))?;
-
-        // 4. Poll keyboard events (crossterm)
-        let elapsed = frame_start.elapsed();
-        let timeout = target_frame_duration.saturating_sub(elapsed);
-
-        if event::poll(timeout)? {
+        // 3. Drain all pending keyboard events (handles Press & Repeat for smooth held-key walking)
+        while event::poll(Duration::from_millis(0))? {
             if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
+                if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat {
                     app.handle_key(key.code);
                 }
             }
         }
 
-        // 5. Yield remaining frame time to CPU
-        let frame_time = frame_start.elapsed();
-        if frame_time < target_frame_duration {
-            tokio::time::sleep(target_frame_duration - frame_time).await;
+        // 4. Zero-frame outbound packet flush: send immediately upon keypress!
+        if let Some(net) = &mut network_opt {
+            while let Some(client_packet) = app.pop_outbound_packet() {
+                net.send(client_packet);
+            }
+        }
+
+        // 5. Update active visual effects, camera & render frame
+        app.tick_effects();
+        terminal.draw(|f| ui::render(f, &mut app))?;
+
+        // 6. Yield remaining frame time while listening for immediate input
+        let elapsed = frame_start.elapsed();
+        if elapsed < target_frame_duration {
+            let remaining = target_frame_duration - elapsed;
+            if event::poll(remaining)? {
+                let mut quick_input = false;
+                while event::poll(Duration::from_millis(0))? {
+                    if let Event::Key(key) = event::read()? {
+                        if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat {
+                            app.handle_key(key.code);
+                            quick_input = true;
+                        }
+                    }
+                }
+                if quick_input {
+                    if let Some(net) = &mut network_opt {
+                        while let Some(client_packet) = app.pop_outbound_packet() {
+                            net.send(client_packet);
+                        }
+                    }
+                }
+            }
         }
     }
 

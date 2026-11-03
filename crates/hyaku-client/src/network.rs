@@ -35,6 +35,9 @@ pub fn spawn_network(url: String) -> NetworkHandle {
     tokio::spawn(async move {
         match connect_async(&url).await {
             Ok((ws_stream, _)) => {
+                if let tokio_tungstenite::MaybeTlsStream::Plain(tcp) = ws_stream.get_ref() {
+                    let _ = tcp.set_nodelay(true);
+                }
                 connected_clone.store(true, Ordering::Relaxed);
                 let (mut ws_write, mut ws_read) = ws_stream.split();
 

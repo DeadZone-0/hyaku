@@ -1,7 +1,7 @@
 use crossterm::event::KeyCode;
 use hyaku_protocol::{
     get_class_preset, ClientPacket, Direction, FloorCarving, FloorMap, PlayerState, Position,
-    ServerPacket, TickState, PLAYER_CLASSES,
+    ProjectileState, ServerPacket, TickState, PLAYER_CLASSES,
 };
 use ratatui::style::Color;
 use std::collections::HashMap;
@@ -123,6 +123,8 @@ pub struct AppState {
     pub title_edit_name: bool,
     pub last_dir: Direction,
     pub server_banner: Option<ServerBannerData>,
+    pub predicted_pos: Option<Position>,
+    pub predicted_time: Option<std::time::Instant>,
 }
 
 impl AppState {
@@ -153,6 +155,8 @@ impl AppState {
             title_edit_name: false,
             last_dir: Direction::Down,
             server_banner: None,
+            predicted_pos: None,
+            predicted_time: None,
         }
     }
 
@@ -217,6 +221,84 @@ impl AppState {
         let id = self.my_player_id.as_ref()?;
         let tick = self.tick_state.as_ref()?;
         tick.players.iter().find(|p| &p.id == id)
+    }
+
+    pub fn try_predict_move(&mut self, dir: Direction) {
+        if let Some(id) = &self.my_player_id {
+            if let Some(tick) = &mut self.tick_state {
+                if let Some(player) = tick.players.iter_mut().find(|p| &p.id == id) {
+                    if !player.is_alive() {
+                        return;
+                    }
+                    let next_pos = player.pos.step(dir);
+                    let can_walk = if let Some(map) = &self.current_map {
+                        if next_pos.in_bounds(map.width, map.height) {
+                            if let Some(&(_, override_tile)) =
+                                tick.tiles_override.iter().find(|(p, _)| *p == next_pos)
+                            {
+                                override_tile.is_walkable()
+                            } else if let Some(tile) = map.get_tile(next_pos) {
+                                tile.is_walkable()
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        true
+                    };
+
+                    if can_walk {
+                        player.pos = next_pos;
+                        self.predicted_pos = Some(next_pos);
+                        self.predicted_time = Some(std::time::Instant::now());
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn trigger_local_attack_fx(&mut self, dir: Direction) {
+        self.screen_flash = Some((Color::White, 2));
+        if let Some(player) = self.my_player() {
+            let origin = player.pos;
+            let (map_w, map_h) = self
+                .current_map
+                .as_ref()
+                .map(|m| (m.width, m.height))
+                .unwrap_or((80, 30));
+            let tiles = match dir {
+                Direction::Up => [
+                    (Position::new(origin.x - 1, origin.y - 1), '╱'),
+                    (Position::new(origin.x, origin.y - 1), '─'),
+                    (Position::new(origin.x + 1, origin.y - 1), '╲'),
+                ],
+                Direction::Down => [
+                    (Position::new(origin.x - 1, origin.y + 1), '╲'),
+                    (Position::new(origin.x, origin.y + 1), '─'),
+                    (Position::new(origin.x + 1, origin.y + 1), '╱'),
+                ],
+                Direction::Left => [
+                    (Position::new(origin.x - 1, origin.y - 1), '╲'),
+                    (Position::new(origin.x - 1, origin.y), '│'),
+                    (Position::new(origin.x - 1, origin.y + 1), '╱'),
+                ],
+                Direction::Right => [
+                    (Position::new(origin.x + 1, origin.y - 1), '╱'),
+                    (Position::new(origin.x + 1, origin.y), '│'),
+                    (Position::new(origin.x + 1, origin.y + 1), '╲'),
+                ],
+            };
+            if let Some(tick) = &mut self.tick_state {
+                for (pos, glyph) in tiles {
+                    if pos.in_bounds(map_w, map_h) {
+                        tick.projectiles
+                            .push(ProjectileState::new(pos, glyph, (255, 230, 100)));
+                    }
+                }
+            }
+        }
     }
 
     pub fn nearby_carving(&self) -> Option<&FloorCarving> {
@@ -556,18 +638,22 @@ impl AppState {
             }
             KeyCode::Up | KeyCode::Char('w') | KeyCode::Char('k') => {
                 self.last_dir = Direction::Up;
+                self.try_predict_move(Direction::Up);
                 self.queue_packet(ClientPacket::Move(Direction::Up));
             }
             KeyCode::Down | KeyCode::Char('s') | KeyCode::Char('j') => {
                 self.last_dir = Direction::Down;
+                self.try_predict_move(Direction::Down);
                 self.queue_packet(ClientPacket::Move(Direction::Down));
             }
             KeyCode::Left | KeyCode::Char('a') | KeyCode::Char('h') => {
                 self.last_dir = Direction::Left;
+                self.try_predict_move(Direction::Left);
                 self.queue_packet(ClientPacket::Move(Direction::Left));
             }
             KeyCode::Right | KeyCode::Char('d') | KeyCode::Char('l') => {
                 self.last_dir = Direction::Right;
+                self.try_predict_move(Direction::Right);
                 self.queue_packet(ClientPacket::Move(Direction::Right));
             }
             KeyCode::Char(' ') => {
@@ -577,6 +663,7 @@ impl AppState {
                     2 => "Gale Piercer",
                     _ => "Adamantine Strike",
                 };
+                self.trigger_local_attack_fx(self.last_dir);
                 self.announcement = Some(format!("Striking with {} towards {}", action_desc, self.last_dir));
                 self.queue_packet(ClientPacket::Attack(self.last_dir));
             }
@@ -811,11 +898,84 @@ impl AppState {
                 self.screen = Screen::Connected;
                 self.announcement = Some(format!("Entered Floor {} of the Tower", floor));
             }
-            ServerPacket::Tick(state) => {
+            ServerPacket::Tick(mut state) => {
                 if self.current_floor != state.floor {
                     self.current_floor = state.floor;
                     self.current_map = Some(FloorMap::generate(self.world_seed, state.floor));
+                    self.predicted_pos = None;
+                    self.predicted_time = None;
                 }
+
+                // Reconcile client-predicted movement with incoming server tick
+                if let (Some(my_id), Some(predicted)) = (&self.my_player_id, self.predicted_pos) {
+                    if let Some(player) = state.players.iter_mut().find(|p| &p.id == my_id) {
+                        if player.pos == predicted {
+                            self.predicted_pos = None;
+                            self.predicted_time = None;
+                        } else if let Some(time) = self.predicted_time {
+                            // Within 350ms RTT window: prevent in-flight old server ticks from causing jitter
+                            if time.elapsed() < std::time::Duration::from_millis(350) {
+                                player.pos = predicted;
+                            } else {
+                                self.predicted_pos = None;
+                                self.predicted_time = None;
+                            }
+                        }
+                    }
+                }
+
+                // 2. Track HP deltas between ticks for per-player damage feedback
+                let mut floaters: Vec<(Position, String, Color)> = Vec::new();
+                let mut local_took_damage = false;
+
+                if let Some(old_tick) = &self.tick_state {
+                    // Check players taking damage or healing
+                    for new_player in &state.players {
+                        if let Some(old_player) = old_tick.players.iter().find(|p| p.id == new_player.id) {
+                            if new_player.hp < old_player.hp {
+                                let dmg = old_player.hp - new_player.hp;
+                                floaters.push((
+                                    new_player.pos,
+                                    format!("-{} HP", dmg),
+                                    Color::Rgb(255, 60, 60),
+                                ));
+                                // ONLY flash the screen red if the LOCAL player was damaged!
+                                if self.my_player_id.as_deref() == Some(&new_player.id) {
+                                    local_took_damage = true;
+                                }
+                            } else if new_player.hp > old_player.hp && old_player.hp > 0 {
+                                let heal = new_player.hp - old_player.hp;
+                                floaters.push((
+                                    new_player.pos,
+                                    format!("+{} HP", heal),
+                                    Color::Green,
+                                ));
+                            }
+                        }
+                    }
+
+                    // Check enemies taking damage
+                    for new_enemy in &state.enemies {
+                        if let Some(old_enemy) = old_tick.enemies.iter().find(|e| e.id == new_enemy.id) {
+                            if new_enemy.hp < old_enemy.hp {
+                                let dmg = old_enemy.hp - new_enemy.hp;
+                                floaters.push((
+                                    new_enemy.pos,
+                                    format!("-{} DMG", dmg),
+                                    Color::Rgb(255, 220, 60),
+                                ));
+                            }
+                        }
+                    }
+                }
+
+                for (pos, text, color) in floaters {
+                    self.spawn_floating_text(pos, text, color);
+                }
+                if local_took_damage {
+                    self.screen_flash = Some((Color::Red, 4));
+                }
+
                 self.tick_state = Some(state);
             }
             ServerPacket::FloorTransition {
@@ -852,48 +1012,17 @@ impl AppState {
                     self.combat_log.remove(0);
                 }
 
-                if text.contains("ABYSS EXECUTION") {
-                    self.screen_flash = Some((Color::Magenta, 5));
-                    if let Some(me) = self.my_player() {
-                        let front = me.pos.step(self.last_dir);
-                        self.spawn_floating_text(front, "*VOID FALL!*".to_string(), Color::LightMagenta);
-                    }
-                } else if text.contains("WALL SLAM") {
-                    self.screen_flash = Some((Color::Yellow, 4));
-                    if let Some(me) = self.my_player() {
-                        let front = me.pos.step(self.last_dir);
-                        self.spawn_floating_text(front, "*SLAM +8*".to_string(), Color::Yellow);
-                    }
-                } else if text.contains("CRIT") {
-                    self.screen_flash = Some((Color::Rgb(255, 230, 40), 3));
-                    if let Some(me) = self.my_player() {
-                        let front = me.pos.step(self.last_dir);
-                        self.spawn_floating_text(front, "*CRIT!*".to_string(), Color::Rgb(255, 230, 40));
-                    }
-                } else if text.contains("MELEE SWEEP") || text.contains("sliced") {
-                    self.screen_flash = Some((Color::White, 2));
-                    if let Some(me) = self.my_player() {
-                        let front = me.pos.step(self.last_dir);
-                        let dmg_str = if let Some(idx) = text.find("for ") {
-                            let rest = &text[idx + 4..];
-                            let num = rest.split_whitespace().next().unwrap_or("");
-                            format!("-{} DMG", num)
-                        } else {
-                            "*HIT*".to_string()
-                        };
-                        self.spawn_floating_text(front, dmg_str, Color::Rgb(255, 220, 60));
-                    }
-                } else if text.contains("CONTACT DAMAGE") || text.contains("struck") {
-                    self.screen_flash = Some((Color::Red, 4));
-                    if let Some(me) = self.my_player() {
-                        let dmg_str = if let Some(idx) = text.find("for ") {
-                            let rest = &text[idx + 4..];
-                            let num = rest.split_whitespace().next().unwrap_or("8");
-                            format!("-{} HP", num)
-                        } else {
-                            "-HURT-".to_string()
-                        };
-                        self.spawn_floating_text(me.pos, dmg_str, Color::Rgb(255, 60, 60));
+                // Personal combo feedback: only trigger screen flash if local player performed the combo
+                let is_my_action = text.contains(&format!(":: {}", self.username))
+                    || text.contains(&format!("@{}", self.username));
+
+                if is_my_action {
+                    if text.contains("ABYSS EXECUTION") {
+                        self.screen_flash = Some((Color::Magenta, 5));
+                    } else if text.contains("WALL SLAM") {
+                        self.screen_flash = Some((Color::Yellow, 4));
+                    } else if text.contains("CRIT") {
+                        self.screen_flash = Some((Color::Rgb(255, 230, 40), 3));
                     }
                 }
             }
@@ -1152,5 +1281,109 @@ mod tests {
         }
         app.handle_key(KeyCode::Char('e'));
         assert_eq!(app.pop_outbound_packet(), Some(ClientPacket::ReviveAlly { target_id: "p-2".to_string() }));
+    }
+
+    #[test]
+    fn test_client_side_prediction_and_reconciliation() {
+        let mut app = AppState::new("Ze".to_string(), "ws://127.0.0.1:3000/ws".to_string(), 0);
+        app.screen = Screen::Connected;
+        app.my_player_id = Some("p-1".to_string());
+        app.current_map = Some(FloorMap::generate(42, 1));
+
+        let p = PlayerState::new("p-1".to_string(), "Ze".to_string(), 0, Position::new(10, 10), 1);
+        app.tick_state = Some(TickState {
+            tick: 1,
+            floor: 1,
+            players: vec![p],
+            enemies: Vec::new(),
+            projectiles: Vec::new(),
+            tiles_override: Vec::new(),
+            carvings: Vec::new(),
+            tower_shards_bank: 0,
+            decoys: Vec::new(),
+            shrine_shards: 0,
+            shrine_goal: 10,
+            stairs_unlocked: false,
+        });
+
+        // Press 'd' (move Right): position must immediately update to (11, 10) locally
+        app.handle_key(KeyCode::Char('d'));
+        assert_eq!(app.my_player().unwrap().pos, Position::new(11, 10));
+        assert_eq!(app.predicted_pos, Some(Position::new(11, 10)));
+        assert_eq!(app.pop_outbound_packet(), Some(ClientPacket::Move(Direction::Right)));
+
+        // An old in-flight server tick arrives with old pos (10, 10)
+        let mut old_tick = app.tick_state.as_ref().unwrap().clone();
+        old_tick.tick = 2;
+        old_tick.players[0].pos = Position::new(10, 10);
+        app.handle_server_packet(ServerPacket::Tick(old_tick));
+
+        // Prediction prevents rubberbanding back to (10, 10)
+        assert_eq!(app.my_player().unwrap().pos, Position::new(11, 10));
+
+        // New server tick arrives confirming pos (11, 10)
+        let mut confirmed_tick = app.tick_state.as_ref().unwrap().clone();
+        confirmed_tick.tick = 3;
+        confirmed_tick.players[0].pos = Position::new(11, 10);
+        app.handle_server_packet(ServerPacket::Tick(confirmed_tick));
+
+        // Prediction clears cleanly upon confirmation
+        assert_eq!(app.predicted_pos, None);
+        assert_eq!(app.my_player().unwrap().pos, Position::new(11, 10));
+    }
+
+    #[test]
+    fn test_damage_isolation_between_players() {
+        let mut app = AppState::new("Ze".to_string(), "ws://127.0.0.1:3000/ws".to_string(), 0);
+        app.screen = Screen::Connected;
+        app.my_player_id = Some("p-1".to_string());
+        app.current_map = Some(FloorMap::generate(42, 1));
+
+        let me = PlayerState::new("p-1".to_string(), "Ze".to_string(), 0, Position::new(10, 10), 1);
+        let mut ally = PlayerState::new("p-2".to_string(), "Bob".to_string(), 1, Position::new(20, 20), 1);
+        ally.hp = 100;
+        ally.max_hp = 100;
+
+        app.tick_state = Some(TickState {
+            tick: 1,
+            floor: 1,
+            players: vec![me, ally.clone()],
+            enemies: Vec::new(),
+            projectiles: Vec::new(),
+            tiles_override: Vec::new(),
+            carvings: Vec::new(),
+            tower_shards_bank: 0,
+            decoys: Vec::new(),
+            shrine_shards: 0,
+            shrine_goal: 10,
+            stairs_unlocked: false,
+        });
+
+        // Tick 2: Teammate Bob takes 15 damage (HP: 100 -> 85). Local player takes 0 damage.
+        let mut tick_2 = app.tick_state.as_ref().unwrap().clone();
+        tick_2.tick = 2;
+        tick_2.players[1].hp = 85;
+        app.handle_server_packet(ServerPacket::Tick(tick_2));
+
+        // Local player screen must NOT flash red when a teammate takes damage
+        assert_eq!(app.screen_flash, None, "Local screen must not flash red for teammate damage");
+
+        // Floating text for teammate damage must appear at Bob's position (20, 20), not Ze's position
+        let bob_floater = app.floating_texts.iter().find(|ft| ft.text == "-15 HP");
+        assert!(bob_floater.is_some(), "-15 HP floater must spawn");
+        assert_eq!(bob_floater.unwrap().pos, Position::new(20, 20));
+
+        // Tick 3: Local player Ze takes 20 damage (HP: 120 -> 100).
+        let mut tick_3 = app.tick_state.as_ref().unwrap().clone();
+        tick_3.tick = 3;
+        tick_3.players[0].hp = 100;
+        app.handle_server_packet(ServerPacket::Tick(tick_3));
+
+        // Local screen DOES flash red when local player takes damage
+        assert_eq!(app.screen_flash, Some((Color::Red, 4)));
+
+        let ze_floater = app.floating_texts.iter().find(|ft| ft.text == "-20 HP");
+        assert!(ze_floater.is_some());
+        assert_eq!(ze_floater.unwrap().pos, Position::new(10, 10));
     }
 }

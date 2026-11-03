@@ -7,7 +7,7 @@ use tokio::sync::RwLock;
 use tokio::time::{interval, MissedTickBehavior};
 
 pub async fn run_tick_loop(state: Arc<RwLock<ServerState>>) {
-    let mut ticker = interval(Duration::from_millis(50));
+    let mut ticker = interval(Duration::from_millis(33)); // 30 TPS loop
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {

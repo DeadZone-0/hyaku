@@ -58,7 +58,32 @@ async fn main() {
         .expect("failed to bind server port");
 
     println!("[HYAKU] Ready. Clients may connect to ws://{}/ws", bind_addr);
-    axum::serve(listener, app).await.expect("server failed");
+
+    struct NodelayListener(tokio::net::TcpListener);
+    impl axum::serve::Listener for NodelayListener {
+        type Io = tokio::net::TcpStream;
+        type Addr = std::net::SocketAddr;
+
+        async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+            loop {
+                match self.0.accept().await {
+                    Ok((stream, addr)) => {
+                        let _ = stream.set_nodelay(true);
+                        return (stream, addr);
+                    }
+                    Err(_) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                }
+            }
+        }
+
+        fn local_addr(&self) -> Result<Self::Addr, std::io::Error> {
+            self.0.local_addr()
+        }
+    }
+
+    axum::serve(NodelayListener(listener), app).await.expect("server failed");
 }
 
 async fn ws_handler(
