@@ -13,6 +13,13 @@ hyaku
 
 The client defaults to the Hack Club Nest server at `ws://[2a01:4f9:3080:3192::2124]:3000/ws`. Use `hyaku-update` when a new release comes out. Pass `--server URL` to pick a server, `--connect` to skip the title screen, or `--mute` to turn off audio. The rest of this guide describes the code in this checkout.
 
+## Screenshots
+![Hyaku Mainmenu](ss/mainmenu.png)
+![Hyaku ass](ss/theass.png)
+![Hyaku gameplay](ss/dead.png)
+
+
+
 
 ## Play locally
 
