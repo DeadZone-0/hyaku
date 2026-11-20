@@ -10,7 +10,7 @@ pub mod tile;
 pub use direction::Direction;
 pub use entity::{
     get_class_preset, BossPhase, DecoyState, EnemyKind, EnemyState, FloorCarving, PlayerClassPreset, PlayerState,
-    ProjectileState, PLAYER_CLASSES,
+    ProjectileState, RaidBoss, BOW_RANGE, PLAYER_CLASSES, RANGER_CLASS,
 };
 pub use map::{FloorMap, Rect};
 pub use map_gen::{
@@ -20,8 +20,14 @@ pub use map_gen::{
 };
 pub use packet::{ClientPacket, HallOfFame, ResumeKey, ServerPacket, TickState};
 pub use position::Position;
-pub use slash::{slash_tiles, SlashTile};
+pub use slash::{basic_attack_tiles, slash_tiles, SlashTile};
 pub use tile::Tile;
+
+pub const SERVER_TICK_MS: u64 = 33;
+
+pub fn tether_range(floor: u32) -> u32 {
+    if RaidBoss::for_floor(floor).is_some() { 13 } else { 8 }
+}
 
 #[cfg(test)]
 mod tests {
@@ -217,6 +223,7 @@ mod tests {
 
     #[test]
     fn test_circular_boss_arena_every_10th_floor() {
+        let mut names = std::collections::HashSet::new();
         for floor in (10..=100).step_by(10) {
             let map = FloorMap::generate(777, floor);
             assert_eq!(map.floor, floor);
@@ -230,6 +237,18 @@ mod tests {
             let boss = boss.unwrap();
             assert_eq!(boss.kind, EnemyKind::FloorBoss);
             assert_eq!(boss.boss_phase, Some(BossPhase::Barrage));
+            assert_eq!(boss.raid_boss, RaidBoss::for_floor(floor));
+            assert!(names.insert(boss.name()));
+            assert!(!boss.occupies(map.spawn_pos));
+            let [(first_id, first), (second_id, second)] = map.plates.as_slice() else {
+                panic!("floor {floor} needs two plates");
+            };
+            assert_eq!(first_id, second_id);
+            assert_ne!(first, second);
+            for &pos in [first, second] {
+                assert_eq!(map.get_tile(pos), Some(Tile::PressurePlate { id: *first_id, active: false }));
+                assert!(!boss.occupies(pos));
+            }
 
             // Minions must be present
             assert!(map.initial_enemies.len() >= 4, "Floor {} must have minion escorts", floor);

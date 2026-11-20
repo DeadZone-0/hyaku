@@ -1,11 +1,14 @@
 use crate::sound::Cue;
+use crate::ui::prologue::Prologue;
+use crate::ui::{BurstKind, ParticleField, ENDING_DURATION, RESPAWN_OVERLAY};
 use crossterm::event::KeyCode;
 use hyaku_protocol::{
-    get_class_preset, slash_tiles, ClientPacket, Direction, FloorCarving, FloorMap, HallOfFame, PlayerState, Position,
+    basic_attack_tiles, get_class_preset, tether_range, ClientPacket, Direction, FloorCarving, FloorMap, HallOfFame, PlayerState, Position,
     ProjectileState, ServerPacket, SlashTile, TickState, PLAYER_CLASSES,
 };
 use ratatui::style::Color;
 use std::collections::HashMap;
+use std::time::Instant;
 
 pub const CLASS_PREVIEWS: &[&[&str]] = &[
     &[
@@ -88,6 +91,11 @@ pub struct AppState {
     pub highest_unlocked_floor: u32,
     pub hall_of_fame: HallOfFame,
     pub lore_open: bool,
+    pub victory_open: bool,
+    pub ending_started: Option<Instant>,
+    pub prologue: Option<Prologue>,
+    pub respawned_at: Option<Instant>,
+    pub particles: ParticleField,
     pub lore_floor: u32,
     pub world_seed: u64,
     pub current_map: Option<FloorMap>,
@@ -126,6 +134,11 @@ impl AppState {
             highest_unlocked_floor: 1,
             hall_of_fame: HallOfFame::new(),
             lore_open: false,
+            victory_open: false,
+            ending_started: None,
+            prologue: None,
+            respawned_at: None,
+            particles: ParticleField::default(),
             lore_floor: 1,
             world_seed: 0,
             current_map: None,
@@ -162,6 +175,21 @@ impl AppState {
     }
 
     pub fn tick_effects(&mut self) {
+        if let Some(book) = &mut self.prologue {
+            if book.take_landing() {
+                self.sound_cue = self.sound_cue.max(Some(Cue::BookDrop));
+            }
+            if book.finished() {
+                self.prologue = None;
+            }
+        }
+        if self.ending_started.is_some_and(|start| start.elapsed() >= ENDING_DURATION) {
+            self.ending_started = None;
+        }
+        self.particles.expire(Instant::now());
+        if self.respawned_at.is_some_and(|at| at.elapsed() >= RESPAWN_OVERLAY) {
+            self.respawned_at = None;
+        }
         if let Some((color, ttl)) = self.screen_flash {
             if ttl > 1 {
                 self.screen_flash = Some((color, ttl - 1));
@@ -255,13 +283,25 @@ impl AppState {
         match self.screen {
             Screen::TitleScreen => 1.0,
             Screen::Connecting => 0.35,
+            Screen::Connected if self.prologue.is_some() => 0.85,
+            Screen::Connected if self.ending_started.is_some() => 0.40,
             Screen::Connected => match self.my_player() {
                 None => 0.35,
-                Some(player) if player.is_alive() && !self.tick_state.as_ref().is_some_and(raid_active) => 0.65,
+                Some(player) if player.is_alive() && !self.raid_music_active() => 0.65,
                 _ => 0.0,
             },
             Screen::Disconnected => 0.0,
         }
+    }
+
+    pub fn raid_music_active(&self) -> bool {
+        self.screen == Screen::Connected
+            && self.prologue.is_none()
+            && !self.victory_open
+            && self.my_player().is_some_and(PlayerState::is_alive)
+            && self.tick_state.as_ref().is_some_and(|tick| {
+                tick.floor == self.current_floor && raid_active(tick)
+            })
     }
 
     pub fn attack_tiles(&self) -> Vec<SlashTile> {
@@ -271,7 +311,7 @@ impl AppState {
         if !player.is_alive() {
             return Vec::new();
         }
-        slash_tiles(player.pos, self.last_dir, &tick.enemies, |pos| {
+        basic_attack_tiles(player.class_idx, player.pos, self.last_dir, &tick.enemies, |pos| {
             tick.tiles_override.iter().find(|(p, _)| *p == pos).map(|(_, tile)| *tile)
                 .or_else(|| self.current_map.as_ref()?.get_tile(pos))
         })
@@ -312,6 +352,16 @@ impl AppState {
     }
 
     pub fn handle_key(&mut self, key: KeyCode) {
+        if self.screen == Screen::Connected {
+            if let Some(book) = &mut self.prologue {
+                if key == KeyCode::Esc {
+                    self.prologue = None;
+                } else if book.read_key(key) {
+                    self.sound_cue = self.sound_cue.max(Some(Cue::PageTurn));
+                }
+                return;
+            }
+        }
         let screen = self.screen;
         let editing = self.title_edit_name;
         let lore_open = self.lore_open;
@@ -395,6 +445,22 @@ impl AppState {
     }
 
     fn handle_connected_key(&mut self, key: KeyCode) {
+        if self.ending_started.is_some() {
+            if matches!(key, KeyCode::Enter | KeyCode::Esc) {
+                self.ending_started = None;
+            }
+            return;
+        }
+        if self.victory_open {
+            match key {
+                KeyCode::Enter => self.victory_open = false,
+                KeyCode::Esc | KeyCode::Char('q') => self.should_quit = true,
+                _ => {}
+            }
+            return;
+        }
+        self.respawned_at = None;
+
         if self.lore_open {
             self.lore_floor = match key {
                 KeyCode::Up => self.lore_floor.saturating_sub(1).max(1),
@@ -496,24 +562,26 @@ impl AppState {
                 self.should_quit = true;
             }
             KeyCode::Char('q') | KeyCode::Char('Q') => {
+                let range = tether_range(self.current_floor);
                 let (target_opt, is_already_tethered) = if let (Some(me), Some(tick)) = (self.my_player(), &self.tick_state) {
-                    let cur_tether = me.tether_target.clone();
+                    let cur_tether = me.tether_target.clone().filter(|target| {
+                        tick.players.iter().any(|p| &p.id == target && p.is_alive())
+                            || tick.decoys.iter().any(|d| *target == format!("decoy-{}", d.id))
+                    });
                     if cur_tether.is_some() {
                         (cur_tether, true)
                     } else {
-                        // 1. Find closest alive teammate within 8 tiles
                         let closest_ally = tick.players
                             .iter()
-                            .filter(|p| p.id != me.id && p.is_alive() && me.pos.manhattan_distance(p.pos) <= 8)
+                            .filter(|p| p.id != me.id && p.is_alive() && me.pos.manhattan_distance(p.pos) <= range)
                             .min_by_key(|p| me.pos.manhattan_distance(p.pos))
                             .map(|p| (p.id.clone(), p.username.clone()));
 
-                        // 2. Or fallback to closest Holo-Decoy within 8 tiles (allows solo testing)
                         let closest = closest_ally.or_else(|| {
                             tick.decoys
                                 .iter()
-                                .filter(|d| me.pos.manhattan_distance(d.pos) <= 8)
-                                .min_by_key(|d| me.pos.manhattan_distance(d.pos))
+                                .filter(|d| me.pos.manhattan_distance(d.pos) <= range)
+                                .max_by_key(|d| (d.owner_name == me.username, d.id))
                                 .map(|d| (format!("decoy-{}", d.id), "Holo-Decoy §".to_string()))
                         });
 
@@ -539,21 +607,24 @@ impl AppState {
                             Color::Rgb(120, 240, 255),
                         );
                     }
-                    self.announcement = Some(format!("Forging Lightning Tether with {} (≤8 tiles)! Beam active!", target_name));
+                    self.announcement = Some(format!("Tether linked to {target_name}."));
                     self.queue_packet(ClientPacket::ToggleTether { target_id: Some(target_id) });
                 } else {
                     if let Some(me) = self.my_player() {
                         self.spawn_floating_text(
                             me.pos,
-                            "* [Q] REQUIRES ALLY OR DECOY (≤8m) *".to_string(),
+                            format!("[Q] NEEDS A TARGET WITHIN {range} TILES"),
                             Color::Rgb(255, 100, 100),
                         );
                     }
-                    self.announcement = Some("No teammate or Holo-Decoy within 8 tiles! Stand near an ally or press [R] to drop a Decoy!".to_string());
+                    self.announcement = Some(format!("No ally or decoy within {range} tiles. [R] places a decoy."));
                 }
             }
             KeyCode::Enter => {
                 self.input_mode = InputMode::Chatting;
+            }
+            KeyCode::Char('g') | KeyCode::Char('G') => {
+                self.queue_packet(ClientPacket::TemperGear);
             }
             KeyCode::Char('m') | KeyCode::Char('M') | KeyCode::Char('f') => {
                 self.input_mode = InputMode::CarvingMessage;
@@ -669,7 +740,7 @@ impl AppState {
                             "* HOLO-DECOY § *".to_string(),
                             Color::Rgb(100, 230, 255),
                         );
-                        self.announcement = Some("Projecting Holo-Decoy (15s, -20 MP)...".to_string());
+                        self.announcement = Some("Projecting Holo-Decoy (-20 MP)...".to_string());
                     }
                 }
                 self.queue_packet(ClientPacket::DeployDecoy);
@@ -745,7 +816,7 @@ impl AppState {
 
                 let raid_floor = self.current_floor % 10 == 0;
                 if is_near_shrine && raid_floor {
-                    self.announcement = Some("This shrine heals. It takes no shard offerings.".to_string());
+                    self.announcement = Some("Rest here and recover. This shrine requires no offering.".to_string());
                     return;
                 }
                 if is_near_shrine {
@@ -757,13 +828,13 @@ impl AppState {
                                 Color::Cyan,
                             );
                             self.announcement = Some(format!(
-                                "Offered {} shards to the Floor Shrine [百]!",
+                                "Laying {} shards before the shrine [百]...",
                                 shards
                             ));
                             self.queue_packet(ClientPacket::DepositShards { amount: shards });
                         } else {
                             self.announcement = Some(
-                                "You carry no shards to offer to the Shrine [百]. Slay guardians to collect shards!"
+                                "You have no shards to lay before the shrine. Seek them among the guardians."
                                     .to_string(),
                             );
                         }
@@ -809,15 +880,15 @@ impl AppState {
                             );
                         }
                         self.announcement = Some(if raid_floor {
-                            "Defeat the Gatekeeper to open the stairs.".to_string()
+                            "Set weight upon both plates to open the stair gate.".to_string()
                         } else {
-                            "The gate to the stairs is sealed! Step on the Pressure Plate or slay the Floor Guardian to unseal the ascent!".to_string()
+                            "The gate is sealed. Stand upon its plate or slay its guardian.".to_string()
                         });
                     } else if is_shrine_locked {
                         if let Some((pos, _)) = player_info {
                             self.spawn_floating_text(
                                 pos,
-                                "* SHRINE SEALED! *".to_string(),
+                                "STAIRS SEALED".to_string(),
                                 ratatui::style::Color::LightRed,
                             );
                         }
@@ -826,10 +897,11 @@ impl AppState {
                             .as_ref()
                             .map(|t| (t.shrine_shards, t.shrine_goal))
                             .unwrap_or((0, 0));
-                        self.announcement = Some(format!(
-                            "Gate is OPEN, but Stairs need Shrine [百] offering ({}/{} Shards)! Slay monsters for shards and deposit them at Shrine [百]!",
-                            cur, goal
-                        ));
+                        self.announcement = Some(if raid_floor {
+                            "The keeper yet lives. Slay it to unseal the stairs.".to_string()
+                        } else {
+                            format!("The gate is open. Lay shards before the shrine [百] to wake the stair ({cur}/{goal}).")
+                        });
                     } else {
                         self.queue_packet(ClientPacket::AscendStairs);
                     }
@@ -890,6 +962,7 @@ impl AppState {
                 player_id,
                 floor,
                 map_seed,
+                skip_prologue,
             } => {
                 self.my_player_id = Some(player_id);
                 self.current_floor = floor;
@@ -900,6 +973,14 @@ impl AppState {
                 self.predicted_time = None;
                 self.screen = Screen::Connected;
                 self.lore_open = false;
+                self.victory_open = false;
+                self.ending_started = None;
+                self.prologue = (floor == 1 && !skip_prologue).then(Prologue::new);
+                if self.prologue.is_some() {
+                    self.sound_cue = self.sound_cue.max(Some(Cue::PageTurn));
+                }
+                self.respawned_at = None;
+                self.particles.clear();
                 self.announcement = Some(format!("Entered Floor {} of the Tower", floor));
             }
             ServerPacket::HallOfFame { highest_unlocked_floor, hall_of_fame } => {
@@ -909,6 +990,8 @@ impl AppState {
             }
             ServerPacket::Tick(mut state) => {
                 if self.current_floor != state.floor {
+                    self.particles.clear();
+                    self.respawned_at = None;
                     self.current_floor = state.floor;
                     self.current_map = Some(FloorMap::generate(self.world_seed, state.floor));
                     self.predicted_pos = None;
@@ -951,6 +1034,9 @@ impl AppState {
                     // Check players taking damage or healing
                     for new_player in &state.players {
                         if let Some(old_player) = old_tick.players.iter().find(|p| p.id == new_player.id) {
+                            if old_tick.floor == state.floor && new_player.shards > old_player.shards {
+                                self.particles.emit(new_player.pos, BurstKind::Shards);
+                            }
                             if new_player.hp < old_player.hp {
                                 let dmg = old_player.hp - new_player.hp;
                                 floaters.push((
@@ -983,6 +1069,9 @@ impl AppState {
                             && !old_tick.stairs_unlocked
                         {
                             self.milestone_cues.push(Cue::Shrine);
+                            if let Some(pos) = self.current_map.as_ref().and_then(|map| map.shrine_pos) {
+                                self.particles.emit(pos, BurstKind::Shrine);
+                            }
                         }
 
                         for old_enemy in &old_tick.enemies {
@@ -991,6 +1080,9 @@ impl AppState {
                             if hp < old_enemy.hp {
                                 let dmg = old_enemy.hp - hp;
                                 let pos = current.map_or(old_enemy.pos, |enemy| enemy.pos);
+                                if hp == 0 {
+                                    self.particles.emit(pos, BurstKind::Enemy);
+                                }
                                 if listener.is_some_and(|listener| listener.chebyshev_distance(pos) <= 5) {
                                     cue = cue.max(Some(Cue::Impact));
                                 }
@@ -1014,6 +1106,22 @@ impl AppState {
                 self.sound_cue = self.sound_cue.max(cue);
                 self.tick_state = Some(state);
             }
+            ServerPacket::Victory => {
+                if self.victory_open {
+                    return;
+                }
+                self.victory_open = true;
+                self.ending_started = Some(Instant::now());
+                self.lore_open = false;
+                self.milestone_cues.push(Cue::Ascend);
+            }
+            ServerPacket::Respawned => {
+                self.respawned_at = Some(Instant::now());
+                self.predicted_time = None;
+                self.predicted_pos = None;
+                self.lore_open = false;
+                self.input_mode = InputMode::Normal;
+            }
             ServerPacket::FloorTransition {
                 floor,
                 map_seed,
@@ -1022,6 +1130,8 @@ impl AppState {
                 if floor > self.current_floor {
                     self.milestone_cues.push(Cue::Ascend);
                 }
+                self.particles.clear();
+                self.respawned_at = None;
                 self.current_floor = floor;
                 self.world_seed = map_seed;
                 self.current_map = Some(FloorMap::generate(map_seed, floor));
@@ -1097,6 +1207,54 @@ fn raid_active(tick: &TickState) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn victory_plays_the_ending_before_the_summit_panel() {
+        let mut app = AppState::new("Alice".into(), "ws://localhost".into(), 0);
+        app.screen = Screen::Connected;
+        app.handle_server_packet(ServerPacket::Victory);
+        assert!(app.ending_started.is_some());
+        app.handle_key(KeyCode::Right);
+        assert_eq!(app.pop_outbound_packet(), None);
+
+        app.handle_key(KeyCode::Esc);
+        assert!(app.ending_started.is_none());
+        assert!(app.victory_open);
+        assert!(!app.should_quit);
+        app.handle_key(KeyCode::Enter);
+        assert!(!app.victory_open);
+
+        app.handle_server_packet(ServerPacket::Victory);
+        app.ending_started = Some(Instant::now() - ENDING_DURATION);
+        app.tick_effects();
+        assert!(app.ending_started.is_none());
+        assert!(app.victory_open);
+    }
+
+    #[test]
+    fn prologue_gates_input_until_skipped() {
+        let mut app = AppState::new("Alice".into(), "ws://localhost".into(), 0);
+        let welcome = |floor, skip_prologue| ServerPacket::Welcome {
+            player_id: "p1".into(),
+            floor,
+            map_seed: 42,
+            skip_prologue,
+        };
+        app.handle_server_packet(welcome(1, false));
+        assert!(app.prologue.is_some());
+        app.handle_key(KeyCode::Down);
+        assert_eq!(app.pop_outbound_packet(), None);
+        app.handle_key(KeyCode::Esc);
+        assert!(!app.should_quit);
+        assert!(app.prologue.is_none());
+        app.handle_key(KeyCode::Right);
+        assert_eq!(app.pop_outbound_packet(), Some(ClientPacket::Move(Direction::Right)));
+
+        app.handle_server_packet(welcome(1, true));
+        assert!(app.prologue.is_none());
+        app.handle_server_packet(welcome(10, false));
+        assert!(app.prologue.is_none());
+    }
 
     #[test]
     fn test_app_title_navigation() {
@@ -1387,10 +1545,12 @@ mod tests {
     #[test]
     fn floor_and_shrine_cues_follow_confirmed_progress() {
         let mut app = AppState::new("Alice".into(), "ws://localhost".into(), 0);
+        app.screen = Screen::Connected;
+        app.my_player_id = Some("p1".into());
         let mut tick = TickState {
             tick: 1,
             floor: 2,
-            players: Vec::new(),
+            players: vec![PlayerState::new("p1".into(), "Alice".into(), 0, Position::new(10, 10), 2)],
             enemies: Vec::new(),
             projectiles: Vec::new(),
             tiles_override: Vec::new(),
@@ -1424,9 +1584,15 @@ mod tests {
         raid.stairs_unlocked = false;
         raid.enemies = app.current_map.as_ref().unwrap().initial_enemies.clone();
         app.handle_server_packet(ServerPacket::Tick(raid.clone()));
+        assert!(app.raid_music_active());
+        assert_eq!(app.ambience_level(), 0.0);
         raid.stairs_unlocked = true;
-        app.handle_server_packet(ServerPacket::Tick(raid));
+        app.handle_server_packet(ServerPacket::Tick(raid.clone()));
         assert_eq!(app.milestone_cues, [Cue::Shrine, Cue::Ascend, Cue::Raid]);
+        raid.enemies.clear();
+        app.handle_server_packet(ServerPacket::Tick(raid));
+        assert!(!app.raid_music_active());
+        assert_eq!(app.ambience_level(), 0.65);
     }
 
     #[test]

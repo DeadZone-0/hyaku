@@ -42,29 +42,40 @@ async fn main() {
     println!("{}", STARTUP_BANNER);
     println!("[HYAKU] Initializing authoritative world state...");
 
-    let world_seed = 42424242;
-    let save_path = std::env::var_os("HYAKU_SAVE_PATH")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| "hyaku_save.json".into());
-    let saved = ServerState::load(world_seed, save_path.clone())
-        .unwrap_or_else(|error| panic!("load {}: {error}", save_path.display()));
-    let server_state = Arc::new(RwLock::new(saved));
+    let bind_addr = std::env::var("HYAKU_BIND_ADDR").unwrap_or_else(|_| "[::]:3000".to_string());
+    let listener = tokio::net::TcpListener::bind(&bind_addr)
+        .await
+        .expect("failed to bind server port");
+    let address = listener.local_addr().expect("read server address");
 
-    // Spawn 20-TPS authoritative game loop
+    let world_seed = 42424242;
+    let saved = if let Some(value) = std::env::var_os("HYAKU_RAID_TEST_FLOOR") {
+        assert!(address.ip().is_loopback(), "raid practice only listens on loopback");
+        let floor = value.to_str()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|floor| (10..=100).contains(floor) && floor % 10 == 0)
+            .expect("raid practice requires a floor from 10 through 100 in steps of 10");
+        ServerState::raid_practice(world_seed, floor)
+    } else if std::env::var_os("HYAKU_DEMO").is_some_and(|value| value == "1") {
+        assert!(address.ip().is_loopback(), "the demo lobby only listens on loopback");
+        let mut state = ServerState::new(world_seed);
+        state.enable_demo_lobby();
+        state
+    } else {
+        let save_path = std::env::var_os("HYAKU_SAVE_PATH")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| "hyaku_save.json".into());
+        ServerState::load(world_seed, save_path.clone())
+            .unwrap_or_else(|error| panic!("load {}: {error}", save_path.display()))
+    };
+    let server_state = Arc::new(RwLock::new(saved));
     tokio::spawn(tick::run_tick_loop(server_state.clone()));
 
     let app = Router::new()
         .route("/ws", get(ws_handler))
         .with_state(server_state);
 
-    let bind_addr = std::env::var("HYAKU_BIND_ADDR").unwrap_or_else(|_| "[::]:3000".to_string());
-    println!("[HYAKU] Binding WebSocket listener on {}", bind_addr);
-
-    let listener = tokio::net::TcpListener::bind(&bind_addr)
-        .await
-        .expect("failed to bind server port");
-
-    println!("[HYAKU] Ready. Clients may connect to ws://{}/ws", bind_addr);
+    println!("[HYAKU] Ready. Clients may connect to ws://{address}/ws");
 
     struct NodelayListener(tokio::net::TcpListener);
     impl axum::serve::Listener for NodelayListener {

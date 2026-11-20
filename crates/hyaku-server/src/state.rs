@@ -2,7 +2,7 @@ use crate::boss::BossRaid;
 use crate::db::{Database, FloorProgress, SavedCarving, SavedFloor, SavedLocation};
 use hyaku_protocol::{
     ClientPacket, DecoyState, Direction, EnemyKind, EnemyState, FloorCarving, FloorMap, PlayerState,
-    ProjectileState, ResumeKey, ServerPacket, TickState, Tile, Position,
+    ProjectileState, RaidBoss, ResumeKey, ServerPacket, TickState, Tile, Position,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -39,6 +39,7 @@ const LOCATION_CHECKPOINT: Duration = Duration::from_secs(5);
 pub struct FloorInstance {
     pub floor: u32,
     raid: BossRaid,
+    practice_lobby: bool,
     pub map: FloorMap,
     pub players: HashMap<String, PlayerState>,
     pub enemies: Vec<EnemyState>,
@@ -81,6 +82,7 @@ impl FloorInstance {
         Self {
             floor,
             raid: BossRaid::default(),
+            practice_lobby: false,
             map: map.clone(),
             players: HashMap::new(),
             enemies,
@@ -154,7 +156,7 @@ impl FloorInstance {
 
     fn saved_location(&self, player: &PlayerState) -> SavedLocation {
         let pos = if player.is_alive() { player.pos } else { self.respawn_position(&player.username) };
-        SavedLocation { floor: self.floor, pos }
+        SavedLocation { floor: self.floor, pos, temper: player.temper }
     }
 
     fn can_rejoin_at(&self, pos: Position) -> bool {
@@ -189,10 +191,6 @@ impl FloorInstance {
                     },
                 );
             }
-        }
-
-        if self.gatekeeper_alive() {
-            return announcements;
         }
 
         // Group plates by gate_id
@@ -238,10 +236,6 @@ impl FloorInstance {
         }
 
         announcements
-    }
-
-    fn gatekeeper_alive(&self) -> bool {
-        self.enemies.iter().any(|e| e.kind == EnemyKind::FloorBoss && e.is_alive())
     }
 
     pub fn get_effective_tile(&self, pos: Position) -> Option<Tile> {
@@ -340,7 +334,7 @@ impl FloorInstance {
         }
 
         let enemy_id = self.enemies[enemy_idx].id;
-        let enemy_name = self.enemies[enemy_idx].kind.name();
+        let enemy_name = self.enemies[enemy_idx].name();
         let is_boss = self.enemies[enemy_idx].is_boss;
 
         let roll = ((self.tick_counter.wrapping_mul(7919))
@@ -492,27 +486,27 @@ impl FloorInstance {
             }
         }
 
-        // 1. Process Enemy AI (Patrol, Chase, Contact Damage)
-        let (ai_projectiles, ai_announcements) = crate::combat::update_enemy_ai(
-            &mut self.enemies,
-            &mut self.players,
-            &self.decoys,
-            &self.map,
-            &self.tiles_override,
-            self.tick_counter,
-        );
-        self.projectiles.extend(ai_projectiles);
-        self.pending_announcements.extend(ai_announcements);
+        if !self.practice_lobby {
+            let (ai_projectiles, ai_announcements) = crate::combat::update_enemy_ai(
+                &mut self.enemies,
+                &mut self.players,
+                &self.decoys,
+                &self.map,
+                &self.tiles_override,
+                self.tick_counter,
+            );
+            self.projectiles.extend(ai_projectiles);
+            self.pending_announcements.extend(ai_announcements);
 
-        // 2. Periodic Floor Monster Spawning (maintains active floor monsters)
-        crate::combat::spawn_floor_monsters_if_needed(
-            &mut self.enemies,
-            &self.map,
-            &self.tiles_override,
-            self.floor,
-            self.tick_counter,
-            4,
-        );
+            crate::combat::spawn_floor_monsters_if_needed(
+                &mut self.enemies,
+                &self.map,
+                &self.tiles_override,
+                self.floor,
+                self.tick_counter,
+                4,
+            );
+        }
 
         if self.floor % 10 == 0 {
             self.raid.step(
@@ -529,6 +523,7 @@ impl FloorInstance {
             &self.decoys,
             &mut self.enemies,
             self.tick_counter,
+            RaidBoss::for_floor(self.floor).is_some(),
         );
         self.projectiles.extend(tether_result.spark_projectiles);
         self.pending_announcements.extend(tether_result.announcements);
@@ -543,20 +538,20 @@ impl FloorInstance {
             }
         });
 
-        let gatekeeper_defeated = self.enemies.iter().any(|e| {
+        let fallen_boss = self.enemies.iter().find(|e| {
             e.kind == EnemyKind::FloorBoss && !e.is_alive()
-        });
+        }).map(EnemyState::name);
         self.enemies.retain(|e| e.is_alive());
 
-        if gatekeeper_defeated {
+        if let Some(name) = fallen_boss {
             self.raid = BossRaid::default();
             self.stairs_unlocked = true;
-            self.pending_announcements.push("Gatekeeper down. Stairs open.".to_string());
-            for &(gate_id, gate_pos) in &self.map.gates {
-                self.unlocked_gates.insert(gate_id);
-                self.tiles_override
-                    .insert(gate_pos, Tile::Gate { id: gate_id, open: true });
-            }
+            let next = if self.map.gates.iter().all(|(id, _)| self.unlocked_gates.contains(id)) {
+                "The stair lies open."
+            } else {
+                "Hold both plates to open the stair gate."
+            };
+            self.pending_announcements.push(format!("{name} has fallen. {next}"));
         }
 
         TickState {
@@ -590,10 +585,11 @@ pub struct ServerState {
     next_location_checkpoint: Instant,
     pending_locations: HashMap<String, SavedLocation>,
     resume_ids: HashMap<String, String>,
+    demo_spawns: Option<[Position; 2]>,
+    raid_start_floor: Option<u32>,
 }
 
 impl ServerState {
-    #[cfg(test)]
     pub fn new(seed: u64) -> Self {
         Self::with_database(Database::memory(seed), seed)
     }
@@ -614,9 +610,31 @@ impl ServerState {
             next_location_checkpoint: Instant::now() + LOCATION_CHECKPOINT,
             pending_locations: HashMap::new(),
             resume_ids: HashMap::new(),
+            demo_spawns: None,
+            raid_start_floor: None,
         };
         state.get_or_create_floor(1);
         state
+    }
+
+    pub fn raid_practice(seed: u64, floor: u32) -> Self {
+        let mut db = Database::memory(seed);
+        db.update(|save| save.highest_unlocked_floor = floor)
+            .expect("practice save is in memory");
+        let mut state = Self::with_database(db, seed);
+        state.raid_start_floor = Some(floor);
+        state
+    }
+
+    pub fn enable_demo_lobby(&mut self) {
+        let floor = self.get_or_create_floor(1);
+        let plates = &floor.map.plates;
+        let left = plates[0].1.add_offset(0, -1);
+        let right = plates[1].1.add_offset(0, -1);
+        let target = Position::new((left.x + right.x) / 2, left.y);
+        floor.practice_lobby = true;
+        floor.enemies.push(EnemyState::new(1, EnemyKind::Crawler, target, 2.0));
+        self.demo_spawns = Some([left, right]);
     }
 
     pub fn get_or_create_floor(&mut self, floor: u32) -> &mut FloorInstance {
@@ -878,19 +896,29 @@ impl ServerState {
                 }).copied()
                     .filter(|location| (1..=self.db.saved().highest_unlocked_floor).contains(&location.floor));
 
-                let start_floor = saved.map_or(1, |location| location.floor);
+                let start_floor = saved.map_or(self.raid_start_floor.unwrap_or(1), |location| location.floor);
                 let world_seed = self.world_seed;
+                let practice = self.raid_start_floor == Some(start_floor);
+                let demo_spawns = self.demo_spawns.filter(|_| start_floor == 1);
                 let floor_inst = self.get_or_create_floor(start_floor);
+                let spawn = demo_spawns.map_or(floor_inst.map.spawn_pos, |spawns| {
+                    spawns[floor_inst.players.len() % spawns.len()]
+                });
                 let spawn_pos = saved.filter(|location| floor_inst.can_rejoin_at(location.pos))
-                    .map_or(floor_inst.map.spawn_pos, |location| location.pos);
+                    .map_or(spawn, |location| location.pos);
 
-                let player = PlayerState::new(
+                let mut player = PlayerState::new(
                     player_id.to_string(),
                     username.clone(),
                     class_idx,
                     spawn_pos,
                     start_floor,
                 );
+                let practice_rank = if practice { (start_floor / 10 - 1).min(8) as u8 } else { 0 };
+                player.set_temper(saved.map_or(practice_rank, |location| location.temper));
+                if practice && saved.is_none() {
+                    player.shards = player.temper_cost().unwrap_or_default();
+                }
 
                 floor_inst.add_player(player);
                 self.client_floors.insert(player_id.to_string(), start_floor);
@@ -903,6 +931,7 @@ impl ServerState {
                         player_id: player_id.to_string(),
                         floor: start_floor,
                         map_seed: world_seed,
+                        skip_prologue: saved.is_some() || demo_spawns.is_some(),
                     });
                     let _ = tx.send(self.hall_of_fame_packet());
                 }
@@ -937,31 +966,21 @@ impl ServerState {
                 if let Some(&floor_num) = self.client_floors.get(player_id) {
                     target_floor = Some(floor_num);
                     if let Some(floor) = self.floors.get_mut(&floor_num) {
-                        let player_info = floor.players.get(player_id).and_then(|p| {
-                            if p.is_alive() {
-                                Some((p.class_idx, p.username.clone(), p.pos))
-                            } else {
-                                None
-                            }
-                        });
-
-                        if let Some((class_idx, player_name, start_pos)) = player_info {
-                            let slash_res = crate::combat::execute_directional_slash(
-                                start_pos,
-                                &player_name,
+                        if let Some(player) = floor.players.get(player_id).filter(|p| p.is_alive()) {
+                            let attack = crate::combat::execute_basic_attack(
+                                player,
                                 dir,
-                                class_idx,
                                 |pos| FloorInstance::resolve_tile(&floor.map, &floor.tiles_override, pos),
                                 &mut floor.enemies,
                                 floor.tick_counter,
                             );
 
-                            floor.projectiles.extend(slash_res.slash_projectiles);
-                            announcements.extend(slash_res.announcements);
+                            floor.projectiles.extend(attack.projectiles);
+                            announcements.extend(attack.announcements);
 
-                            if slash_res.shards_dropped > 0 {
+                            if attack.shards_dropped > 0 {
                                 if let Some(p) = floor.players.get_mut(player_id) {
-                                    p.shards += slash_res.shards_dropped;
+                                    p.shards += attack.shards_dropped;
                                 }
                             }
                         }
@@ -984,16 +1003,13 @@ impl ServerState {
                     if let Some(floor) = self.floors.get_mut(&floor_num) {
                         let player_info = floor.players.get(player_id).and_then(|p| {
                             if p.is_alive() {
-                                Some((p.class_idx, p.username.clone(), p.pos, p.mana))
+                                Some((p.class_idx, p.username.clone(), p.pos, p.mana, p.attack_power()))
                             } else {
                                 None
                             }
                         });
 
-                        if let Some((class_idx, player_name, start_pos, cur_mana)) = player_info {
-                            let class_preset = hyaku_protocol::get_class_preset(class_idx);
-                            let base_dmg = class_preset.attack_power;
-
+                        if let Some((class_idx, player_name, start_pos, cur_mana, base_dmg)) = player_info {
                             let (mana_cost, skill_name) = match class_idx {
                                 0 => (15, "Iai: Eightfold Bloom"),
                                 1 => (20, "Aether Rupture: Singularity"),
@@ -1299,8 +1315,8 @@ impl ServerState {
                                 let decoy_id = floor.next_decoy_id;
                                 floor.next_decoy_id += 1;
 
-                                // Holo-Decoy: 15 seconds at 20-TPS = 300 ticks
-                                let decoy = DecoyState::new(decoy_id, username.clone(), pos, 300);
+                                let lifetime = if RaidBoss::for_floor(floor_num).is_some() { 900 } else { 300 };
+                                let decoy = DecoyState::new(decoy_id, username.clone(), pos, lifetime);
                                 floor.decoys.push(decoy);
 
                                 floor.projectiles.push((
@@ -1311,12 +1327,12 @@ impl ServerState {
                                 unseal_events = floor.check_pressure_plates();
 
                                 println!(
-                                    "[HYAKU ACTION] Player '{}' deployed Holo-Decoy at ({}, {}) (-20 MP, 15s)",
-                                    username, pos.x, pos.y
+                                    "[HYAKU ACTION] Player '{}' deployed Holo-Decoy at ({}, {}) (-20 MP, {} ticks)",
+                                    username, pos.x, pos.y, lifetime
                                 );
 
                                 deploy_announcement = Some(format!(
-                                    "* [HOLO-DECOY] @{} projected a Holo-Decoy at ({}, {})! (Lasts 15s, holds pressure plates) *",
+                                    "* [HOLO-DECOY] @{} projected a Holo-Decoy at ({}, {})! (Holds pressure plates) *",
                                     username, pos.x, pos.y
                                 ));
                             } else {
@@ -1342,6 +1358,40 @@ impl ServerState {
                 }
             }
 
+            ClientPacket::TemperGear => {
+                let Some(&floor_num) = self.client_floors.get(player_id) else { return };
+                let floor = &self.floors[&floor_num];
+                let Some(player) = floor.players.get(player_id).filter(|p| p.is_alive()) else { return };
+                let Some(cost) = player.temper_cost() else {
+                    self.tell(player_id, "Your gear is fully tempered.");
+                    return;
+                };
+                let at_fire = (-2..=2).any(|dy| (-2..=2).any(|dx| {
+                    floor.get_effective_tile(player.pos.add_offset(dx, dy)) == Some(Tile::Campfire)
+                }));
+                if !at_fire || player.shards < cost {
+                    self.tell(player_id, format!("Forge an Ember at a campfire with {cost} Shards."));
+                    return;
+                }
+
+                let mut tempered = player.clone();
+                tempered.shards -= cost;
+                tempered.set_temper(player.temper + 1);
+                if let Some(id) = self.resume_ids.get(player_id).cloned() {
+                    let location = floor.saved_location(&tempered);
+                    if let Err(error) = self.db.update(|save| {
+                        save.last_locations.insert(id.clone(), location);
+                    }) {
+                        self.save_failed(player_id, error);
+                        return;
+                    }
+                    self.pending_locations.remove(&id);
+                }
+                let message = format!("Tempered by ember. Gear +{}  •  +9 ATK  +12 HP  +5 MP", tempered.temper);
+                self.floors.get_mut(&floor_num).unwrap().players.insert(player_id.into(), tempered);
+                self.tell(player_id, message);
+            }
+
             ClientPacket::DepositShards { amount } => {
                 if let Some(&floor_num) = self.client_floors.get(player_id) {
                     let mut unsealed_stairs = false;
@@ -1364,7 +1414,7 @@ impl ServerState {
                             }) || matches!(floor.get_effective_tile(pos), Some(Tile::Shrine));
 
                             if floor.floor % 10 == 0 {
-                                direct_msg = Some("This shrine heals. It takes no shard offerings.".to_string());
+                                direct_msg = Some("Rest here and recover. This shrine requires no offering.".to_string());
                             } else if !near_shrine {
                                 direct_msg = Some("You must stand near the Floor Shrine [百] to deposit shards!".to_string());
                             } else {
@@ -1393,7 +1443,7 @@ impl ServerState {
                                     );
 
                                     deposit_announcement = Some(format!(
-                                        "* [SHRINE] @{} offered {} Shards to Floor Shrine [百]! Progress: {}/{} Shards *",
+                                        "@{} laid {} shards before the shrine [百]. Offering {}/{}.",
                                         username, deposit, floor.shrine_shards, floor.shrine_goal
                                     ));
 
@@ -1401,9 +1451,9 @@ impl ServerState {
                                         floor.stairs_unlocked = true;
                                         unsealed_stairs = true;
                                         banner_payload = Some((
-                                            format!("★ [百] TOWER FLOOR {} SHRINE FULFILLED! ★", floor_num),
+                                            format!("THE SHRINE OF FLOOR {floor_num} AWAKENS"),
                                             format!(
-                                                "The shard offering ({}/{}) is complete! The Ascension Stairs have been UNSEALED!",
+                                                "The offering is complete ({}/{} shards). The stair is unsealed.",
                                                 floor.shrine_shards, floor.shrine_goal
                                             ),
                                         ));
@@ -1527,13 +1577,17 @@ impl ServerState {
                                     )
                                 });
 
-                                if floor.gatekeeper_alive() {
-                                    rejection_msg = Some("Defeat the Gatekeeper to open the stairs.".to_string());
+                                if let Some(boss) = floor.enemies.iter().find(|enemy| {
+                                    enemy.kind == EnemyKind::FloorBoss && enemy.is_alive()
+                                }) {
+                                    rejection_msg = Some(format!("{} yet lives. Slay the keeper to unseal the stairs.", boss.name()));
+                                } else if is_gate_locked && RaidBoss::for_floor(current_floor).is_some() {
+                                    rejection_msg = Some("Hold both pressure plates to open the stair gate.".to_string());
                                 } else if is_gate_locked {
-                                    rejection_msg = Some(":: ASCENSION SEALED :: The gate to the stairs is locked! Unlock it via the Pressure Plate or by slaying the Floor Guardian!".to_string());
+                                    rejection_msg = Some("The gate is sealed. Stand upon its plate or slay its guardian.".to_string());
                                 } else if !floor.stairs_unlocked {
                                     rejection_msg = Some(format!(
-                                        ":: SHRINE SEALED :: Gate is OPEN, but Stairs are sealed until the Shrine [百] offering is fulfilled ({}/{} Shards)! Offer shards at the Shrine [百]!",
+                                        "The gate is open. Lay shards before the shrine [百] to wake the stair ({}/{}).",
                                         floor.shrine_shards, floor.shrine_goal
                                     ));
                                 } else {
@@ -1545,7 +1599,7 @@ impl ServerState {
                         }
                         if can_ascend {
                             let next = (current_floor + 1).min(100);
-                            discovered = next > self.db.saved().highest_unlocked_floor;
+                            discovered = current_floor < 100 && next > self.db.saved().highest_unlocked_floor;
                             let author = floor.players[player_id].username.clone();
                             let progress = floor.progress();
                             if let Err(error) = self.db.update(|save| {
@@ -1556,6 +1610,12 @@ impl ServerState {
                                 }
                             }) {
                                 self.save_failed(player_id, error);
+                                return;
+                            }
+                            if current_floor == 100 {
+                                if let Some(tx) = self.clients.get(player_id) {
+                                    let _ = tx.send(ServerPacket::Victory);
+                                }
                                 return;
                             }
                             player_opt = floor.remove_player(player_id);
@@ -1614,6 +1674,9 @@ impl ServerState {
                         }
 
                         if !username.is_empty() {
+                            if let Some(tx) = self.clients.get(player_id) {
+                                let _ = tx.send(ServerPacket::Respawned);
+                            }
                             println!(
                                 "[HYAKU RESPAWN] Player '{}' respawned at ({}, {})",
                                 username, respawn_pos.x, respawn_pos.y
@@ -1822,14 +1885,117 @@ mod tests {
     }
 
     #[test]
+    fn tempering_costs_shards_at_the_fire_and_survives_reconnect() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("hyaku_save.json");
+        let mut server = ServerState::load(42, path.clone()).unwrap();
+        let join = ClientPacket::Join {
+            username: "Alice".into(),
+            class_idx: 1,
+            resume_key: Some(ResumeKey("a".repeat(64))),
+        };
+        server.handle_packet("alice", join.clone());
+        let floor = server.floors.get_mut(&1).unwrap();
+        let player = floor.players.get_mut("alice").unwrap();
+        let base = player.attack_power();
+        player.pos = floor.map.stairs_pos;
+        player.shards = 8;
+        server.handle_packet("alice", ClientPacket::TemperGear);
+        assert_eq!(server.floors[&1].players["alice"].temper, 0);
+
+        let floor = server.floors.get_mut(&1).unwrap();
+        floor.players.get_mut("alice").unwrap().pos = floor.map.spawn_pos;
+        floor.tiles_override.insert(floor.map.spawn_pos, Tile::Campfire);
+        server.handle_packet("alice", ClientPacket::TemperGear);
+        let player = &server.floors[&1].players["alice"];
+        assert_eq!((player.temper, player.shards, player.attack_power()), (1, 0, base + 9));
+        drop(server);
+
+        let mut restored = ServerState::load(42, path).unwrap();
+        restored.handle_packet("returning", join);
+        assert_eq!(restored.floors[&1].players["returning"].attack_power(), base + 9);
+    }
+
+    #[test]
+    fn summit_requires_a_win_and_respawn_is_confirmed_by_the_server() {
+        let mut server = ServerState::new(42);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        server.register_client("alice".into(), tx);
+        let floor = server.get_or_create_floor(100);
+        let stairs = floor.map.stairs_pos;
+        floor.add_player(PlayerState::new("alice".into(), "Alice".into(), 0, stairs, 100));
+        server.client_floors.insert("alice".into(), 100);
+
+        server.handle_packet("alice", ClientPacket::AscendStairs);
+        assert!(matches!(rx.try_recv().unwrap(), ServerPacket::Announcement { .. }));
+
+        let floor = server.floors.get_mut(&100).unwrap();
+        floor.enemies.iter_mut().find(|e| e.kind == EnemyKind::FloorBoss).unwrap().hp = 0;
+        floor.step_tick(0);
+        server.handle_packet("alice", ClientPacket::AscendStairs);
+        assert!(matches!(rx.try_recv().unwrap(), ServerPacket::Announcement { .. }));
+
+        let floor = server.floors.get_mut(&100).unwrap();
+        let left = floor.map.plates[0].1;
+        let right = floor.map.plates[1].1;
+        floor.decoys.push(DecoyState::new(1, "Alice".into(), left, 30));
+        floor.players.get_mut("alice").unwrap().pos = right;
+        assert_eq!(floor.check_pressure_plates().len(), 1);
+        floor.players.get_mut("alice").unwrap().pos = stairs;
+        server.handle_packet("alice", ClientPacket::AscendStairs);
+        assert_eq!(rx.try_recv().unwrap(), ServerPacket::Victory);
+        assert_eq!(server.floors[&100].players["alice"].pos, stairs);
+        assert!(rx.try_recv().is_err());
+
+        server.floors.get_mut(&100).unwrap().players.get_mut("alice").unwrap().hp = 0;
+        server.handle_packet("alice", ClientPacket::Respawn);
+        assert_eq!(rx.try_recv().unwrap(), ServerPacket::Respawned);
+        let floor = &server.floors[&100];
+        assert!(floor.players["alice"].is_alive());
+        assert_eq!(floor.players["alice"].pos, floor.map.spawn_pos);
+    }
+
+    #[test]
+    fn solo_raid_practice_starts_at_each_gatekeeper_and_accepts_a_decoy_tether() {
+        use hyaku_protocol::BossPhase;
+
+        for number in (10..=100).step_by(10) {
+            let mut server = ServerState::raid_practice(42, number);
+            server.handle_packet("tester", ClientPacket::Join {
+                username: "Tester".into(),
+                class_idx: 1,
+                resume_key: None,
+            });
+            assert_eq!(server.client_floors["tester"], number);
+            let floor = server.floors.get_mut(&number).unwrap();
+            let boss = floor.enemies.iter_mut().find(|enemy| enemy.kind == EnemyKind::FloorBoss).unwrap();
+            boss.boss_phase = Some(BossPhase::Shielded);
+            let center = boss.pos;
+            let (half_width, _) = boss.raid_boss.unwrap().half_size();
+
+            floor.players.get_mut("tester").unwrap().pos = center.add_offset(-half_width - 1, 0);
+            server.handle_packet("tester", ClientPacket::DeployDecoy);
+            let floor = server.floors.get_mut(&number).unwrap();
+            let decoy_id = floor.decoys[0].id;
+            floor.players.get_mut("tester").unwrap().pos = center.add_offset(half_width + 1, 0);
+            server.handle_packet("tester", ClientPacket::ToggleTether {
+                target_id: Some(format!("decoy-{decoy_id}")),
+            });
+            let tick = server.floors.get_mut(&number).unwrap().step_tick(0);
+            let boss = tick.enemies.iter().find(|enemy| enemy.kind == EnemyKind::FloorBoss).unwrap();
+            assert_eq!(boss.boss_phase, Some(BossPhase::Exposed));
+        }
+    }
+
+    #[test]
     fn gatekeeper_shield_requires_a_live_ally_and_defeat_opens_stairs() {
         use hyaku_protocol::BossPhase;
 
         let mut floor = FloorInstance::new(10, 42);
         floor.enemies.retain(|e| e.kind == EnemyKind::FloorBoss);
         let center = floor.enemies[0].pos;
-        let west = Position::new(center.x - 3, center.y);
-        let east = Position::new(center.x + 3, center.y);
+        let west = Position::new(center.x - 4, center.y);
+        let east = Position::new(center.x + 4, center.y);
         let plate = floor.map.plates[0].1;
         let gate = floor.map.gates[0].1;
         floor.add_player(PlayerState::new("alice".into(), "Alice".into(), 0, west, 10));
@@ -1838,6 +2004,13 @@ mod tests {
         assert_eq!(floor.get_effective_tile(gate), Some(Tile::Gate { id: 1, open: false }));
         assert!(!floor.stairs_unlocked);
         assert!(!floor.move_player("alice", Direction::Right));
+
+        let other_plate = floor.map.plates[1].1;
+        floor.players.get_mut("alice").unwrap().pos = other_plate;
+        assert_eq!(floor.check_pressure_plates().len(), 1);
+        assert_eq!(floor.get_effective_tile(gate), Some(Tile::Gate { id: 1, open: true }));
+        assert!(!floor.stairs_unlocked);
+        floor.players.get_mut("alice").unwrap().pos = west;
 
         floor.enemies[0].boss_phase = Some(BossPhase::Shielded);
         let hp = floor.enemies[0].hp;
@@ -1861,8 +2034,8 @@ mod tests {
         assert!(floor.hit_enemy_at(center, 25, 0, None, "Alice", &mut hit_gatekeeper).is_none());
 
         floor.enemies[0].hp = 1;
-        let slash = crate::combat::execute_directional_slash(
-            west, "Alice", Direction::Right, 0,
+        let slash = crate::combat::execute_basic_attack(
+            &floor.players["alice"], Direction::Right,
             |pos| FloorInstance::resolve_tile(&floor.map, &floor.tiles_override, pos),
             &mut floor.enemies, floor.tick_counter,
         );
@@ -1987,7 +2160,7 @@ mod tests {
         let mut found_sealed_announcement = false;
         while let Ok(packet) = rx.try_recv() {
             if let ServerPacket::Announcement { text } = packet {
-                if text.contains("ASCENSION SEALED") {
+                if text.contains("The gate is sealed.") {
                     found_sealed_announcement = true;
                 }
             }
@@ -2069,7 +2242,7 @@ mod tests {
         let p = floor.players.get(&client_id).unwrap();
         assert_eq!(p.mana, 10, "Deploying Holo-Decoy must deduct exactly 20 Mana");
         assert_eq!(floor.decoys.len(), 1, "Decoy must be spawned on the floor");
-        assert_eq!(floor.decoys[0].remaining_ticks, 300, "Decoy must have 15s (300 ticks) duration");
+        assert_eq!(floor.decoys[0].remaining_ticks, 300, "Decoy lasts 300 ticks");
 
         // Step floor 299 ticks -> Decoy should still be alive with 1 tick left
         for _ in 0..299 {
@@ -2214,7 +2387,7 @@ mod tests {
         let mut banner_received = false;
         while let Ok(packet) = rx.try_recv() {
             if let ServerPacket::ServerBanner { title, message } = packet {
-                if title.contains("SHRINE FULFILLED") && message.contains("UNSEALED") {
+                if title.contains("AWAKENS") && message.contains("unsealed") {
                     banner_received = true;
                 }
             }

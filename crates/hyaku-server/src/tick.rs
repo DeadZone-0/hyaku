@@ -1,5 +1,5 @@
 use crate::state::ServerState;
-use hyaku_protocol::ServerPacket;
+use hyaku_protocol::{ServerPacket, SERVER_TICK_MS};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,7 +7,7 @@ use tokio::sync::RwLock;
 use tokio::time::{interval, MissedTickBehavior};
 
 pub async fn run_tick_loop(state: Arc<RwLock<ServerState>>) {
-    let mut ticker = interval(Duration::from_millis(33)); // 30 TPS loop
+    let mut ticker = interval(Duration::from_millis(SERVER_TICK_MS));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {

@@ -12,6 +12,9 @@ pub struct PlayerClassPreset {
     pub attack_power: i32,
 }
 
+pub const RANGER_CLASS: usize = 2;
+pub const BOW_RANGE: u8 = 7;
+
 // TODO: Revise class glyphs, names, and colors.
 pub static PLAYER_CLASSES: &[PlayerClassPreset] = &[
     PlayerClassPreset {
@@ -34,7 +37,7 @@ pub static PLAYER_CLASSES: &[PlayerClassPreset] = &[
     },
     PlayerClassPreset {
         name: "Ranger",
-        description: "Agile scout equipped with long-range strikes and swift movement",
+        description: "Loose a bow shot up to seven tiles with Space. Walls and gates stop arrows.",
         glyph: '@',
         color_rgb: (85, 215, 120),
         max_hp: 95,
@@ -70,6 +73,8 @@ pub struct PlayerState {
     pub mana: i32,
     pub max_mana: i32,
     pub shards: u32,
+    #[serde(default, skip_serializing_if = "is_untempered")]
+    pub temper: u8,
     pub floor: u32,
     pub class_idx: usize,
     pub glyph: char,
@@ -90,6 +95,7 @@ impl PlayerState {
             mana: preset.max_mana,
             max_mana: preset.max_mana,
             shards: 0,
+            temper: 0,
             floor,
             class_idx,
             glyph: preset.glyph,
@@ -101,6 +107,24 @@ impl PlayerState {
 
     pub fn is_alive(&self) -> bool {
         self.hp > 0
+    }
+
+    pub fn attack_power(&self) -> i32 {
+        get_class_preset(self.class_idx).attack_power + 9 * i32::from(self.temper)
+    }
+
+    pub fn temper_cost(&self) -> Option<u32> {
+        (self.temper < 9).then(|| 8 + 2 * u32::from(self.temper))
+    }
+
+    pub fn set_temper(&mut self, rank: u8) {
+        let rank = rank.min(9);
+        let gained = i32::from(rank) - i32::from(self.temper);
+        self.max_hp += 12 * gained;
+        self.max_mana += 5 * gained;
+        self.hp = (self.hp + 12 * gained).clamp(0, self.max_hp);
+        self.mana = (self.mana + 5 * gained).clamp(0, self.max_mana);
+        self.temper = rank;
     }
 
     pub fn take_damage(&mut self, amount: i32) {
@@ -123,6 +147,10 @@ impl PlayerState {
             false
         }
     }
+}
+
+fn is_untempered(rank: &u8) -> bool {
+    *rank == 0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -177,6 +205,60 @@ impl EnemyKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RaidBoss {
+    AshWarden,
+    BellKeeper,
+    MireMatron,
+    ChainKnight,
+    GlassRegent,
+    HollowHuntsman,
+    LanternSaint,
+    FrostReaver,
+    CinderColossus,
+    AshSovereign,
+}
+
+impl RaidBoss {
+    pub fn for_floor(floor: u32) -> Option<Self> {
+        Some(match floor {
+            10 => Self::AshWarden,
+            20 => Self::BellKeeper,
+            30 => Self::MireMatron,
+            40 => Self::ChainKnight,
+            50 => Self::GlassRegent,
+            60 => Self::HollowHuntsman,
+            70 => Self::LanternSaint,
+            80 => Self::FrostReaver,
+            90 => Self::CinderColossus,
+            100 => Self::AshSovereign,
+            _ => return None,
+        })
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::AshWarden => "Ash Warden",
+            Self::BellKeeper => "Bell Keeper",
+            Self::MireMatron => "Mire Matron",
+            Self::ChainKnight => "Chain Knight",
+            Self::GlassRegent => "Glass Regent",
+            Self::HollowHuntsman => "Hollow Huntsman",
+            Self::LanternSaint => "Lantern Saint",
+            Self::FrostReaver => "Frost Reaver",
+            Self::CinderColossus => "Cinder Colossus",
+            Self::AshSovereign => "Ash Sovereign",
+        }
+    }
+
+    pub fn half_size(self) -> (i32, i32) {
+        match self {
+            Self::AshSovereign => (5, 3),
+            _ => (3, 2),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BossPhase {
     Barrage,
     Tremor,
@@ -195,6 +277,8 @@ pub struct EnemyState {
     pub is_boss: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boss_phase: Option<BossPhase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raid_boss: Option<RaidBoss>,
 }
 
 impl EnemyState {
@@ -210,6 +294,7 @@ impl EnemyState {
             glyph: kind.default_glyph(),
             is_boss,
             boss_phase: is_boss.then_some(BossPhase::Barrage),
+            raid_boss: None,
         }
     }
 
@@ -219,10 +304,16 @@ impl EnemyState {
 
     pub fn occupies(&self, pos: Position) -> bool {
         if self.kind == EnemyKind::FloorBoss {
-            self.pos.x.abs_diff(pos.x) <= 2 && self.pos.y.abs_diff(pos.y) <= 1
+            let (half_width, half_height) = self.raid_boss.map_or((2, 1), RaidBoss::half_size);
+            self.pos.x.abs_diff(pos.x) <= half_width as u32
+                && self.pos.y.abs_diff(pos.y) <= half_height as u32
         } else {
             self.pos == pos
         }
+    }
+
+    pub fn name(&self) -> &'static str {
+        self.raid_boss.map_or(self.kind.name(), RaidBoss::name)
     }
 
     pub fn take_damage(&mut self, amount: i32) -> i32 {

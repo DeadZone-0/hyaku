@@ -38,6 +38,7 @@ pub enum ClientPacket {
     },
     BuildBridge(Direction),
     LightCampfire,
+    TemperGear,
     CarveFloor {
         message: String,
     },
@@ -93,8 +94,12 @@ pub enum ServerPacket {
         player_id: String,
         floor: u32,
         map_seed: u64,
+        #[serde(default)]
+        skip_prologue: bool,
     },
     Tick(TickState),
+    Victory,
+    Respawned,
     HallOfFame {
         highest_unlocked_floor: u32,
         hall_of_fame: HallOfFame,

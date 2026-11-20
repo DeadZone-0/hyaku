@@ -1,4 +1,4 @@
-use crate::entity::{EnemyKind, EnemyState, FloorCarving};
+use crate::entity::{EnemyKind, EnemyState, FloorCarving, RaidBoss};
 use crate::map::{FloorMap, Rect};
 use crate::position::Position;
 use crate::tile::Tile;
@@ -122,7 +122,7 @@ pub fn parse_ascii_map(floor_num: u32, template: &str, width: i32, height: i32) 
                     let (author, msg) = match hof_counter {
                         1 => (
                             "Pioneer",
-                            "Echoes of the Ancients: 100 floors ascend into the heavens. Seek the Shrines.",
+                            "A hundred floors to the crown. Where the stairs lie still, seek a shrine.",
                         ),
                         2 => (
                             "Ze",
@@ -130,11 +130,11 @@ pub fn parse_ascii_map(floor_num: u32, template: &str, width: i32, height: i32) 
                         ),
                         3 => (
                             "Vanguard",
-                            "Guardian Inscription: In unity lies strength. Stand together upon the plates.",
+                            "Where two stones guard one gate, stand upon them together.",
                         ),
                         _ => (
                             "Elder",
-                            "Ancient Decree: Only those who claim the shards may challenge the 100th Gate.",
+                            "Gather the scattered shards, if you would stand before the hundredth gate.",
                         ),
                     };
                     map.initial_carvings.push(FloorCarving::new(
@@ -158,12 +158,12 @@ pub fn parse_ascii_map(floor_num: u32, template: &str, width: i32, height: i32) 
         map.initial_carvings.push(FloorCarving::new(
             Position::new(39, 25),
             "Watcher".to_string(),
-            "Runestone Mechanism: Depress the southern plate [o] to unseal the ceremonial Gateway.".to_string(),
+            "Put your weight upon the south plate [o]. The first gate shall open.".to_string(),
         ));
         map.initial_carvings.push(FloorCarving::new(
             Position::new(10, 14),
-            "Wanderer".to_string(),
-            "Traveler's Note: Rest by the campfire [*] to heal your spirit before ascending.".to_string(),
+            "Ione".to_string(),
+            "If you are wounded, come to the hearth. Should you pass the Warden, leave word of what you saw.".to_string(),
         ));
     }
 
@@ -173,12 +173,10 @@ pub fn parse_ascii_map(floor_num: u32, template: &str, width: i32, height: i32) 
 /// Generates the giant circular Gatekeeper Boss Arena for every 10th floor (10, 20... 100).
 pub fn generate_circular_boss_arena(
     floor_num: u32,
-    seed: u64,
+    _seed: u64,
     width: i32,
     height: i32,
 ) -> FloorMap {
-    let floor_seed = compute_floor_seed(seed, floor_num);
-    let mut _rng = StdRng::seed_from_u64(floor_seed);
     let mut map = FloorMap::new_empty(floor_num, width, height);
 
     let cx = width / 2;
@@ -211,22 +209,22 @@ pub fn generate_circular_boss_arena(
         map.set_tile(Position::new(px, py), Tile::Wall);
     }
 
-    // 3. Shrine [百] at North, Pressure Plate at South
     let shrine_pos = Position::new(cx, cy - 7);
     map.set_tile(shrine_pos, Tile::Shrine);
     map.shrine_pos = Some(shrine_pos);
 
-    let plate_pos = Position::new(cx, cy + 7);
-    map.set_tile(plate_pos, Tile::PressurePlate { id: 1, active: false });
-    map.plates.push((1, plate_pos));
+    for offset in [-7, -3] {
+        let plate_pos = Position::new(cx + offset, cy + 4);
+        map.set_tile(plate_pos, Tile::PressurePlate { id: 1, active: false });
+        map.plates.push((1, plate_pos));
+    }
 
-    // 4. Safe Spawn point at West + Campfire
-    let spawn_x = cx - (rx * 0.70) as i32;
+    let spawn_x = cx - 8;
     let spawn_pos = Position::new(spawn_x, cy);
     map.spawn_pos = spawn_pos;
     map.set_tile(spawn_pos, Tile::Floor);
 
-    let campfire_pos = Position::new(spawn_x + 3, cy);
+    let campfire_pos = Position::new(spawn_x - 2, cy);
     map.set_tile(campfire_pos, Tile::Campfire);
 
     // 5. Sealed Ascension Stairs Vault at East
@@ -258,14 +256,16 @@ pub fn generate_circular_boss_arena(
     map.set_tile(stairs_pos, Tile::StairsUp);
 
     // 6. Populate Gatekeeper Boss and Minions
-    let hp_mult = 1.0 + (floor_num as f32) * 0.20;
-    let mut boss = EnemyState::new(1, EnemyKind::FloorBoss, Position::new(cx, cy), hp_mult * 2.0);
-    boss.is_boss = true;
+    let hp_mult = 1.0 + floor_num as f32 * 0.05;
+    let mut boss = EnemyState::new(1, EnemyKind::FloorBoss, Position::new(cx, cy), 1.5 * hp_mult);
+    boss.raid_boss = RaidBoss::for_floor(floor_num);
+    let boss_name = boss.name();
     map.initial_enemies.push(boss);
 
     // Minion escorts
     let mut enemy_id = 2;
-    let minion_offsets = [(-4, -2), (4, -2), (-4, 2), (4, 2)];
+    let escort_row = if floor_num == 100 { 4 } else { 3 };
+    let minion_offsets = [(-5, -escort_row), (5, -escort_row), (-5, escort_row), (5, escort_row)];
     for (i, &(ox, oy)) in minion_offsets.iter().enumerate() {
         let kind = if i % 2 == 0 {
             EnemyKind::Brute
@@ -281,11 +281,8 @@ pub fn generate_circular_boss_arena(
     // Atmospheric runestone warning
     map.initial_carvings.push(FloorCarving::new(
         Position::new(spawn_x + 1, cy - 2),
-        "Gatekeeper Guardian".to_string(),
-        format!(
-            "Ascension Trial {}: The Gatekeeper commands the floor. Slay the titan to claim passage.",
-            floor_num
-        ),
+        "Raid Runestone".to_string(),
+        format!("[G] Temper gear at the fire. Face {boss_name} and press [Space] to attack. Hold both plates to open the gate."),
     ));
 
     map
@@ -733,7 +730,7 @@ pub fn generate_procedural_floor(
         Position::new(room_spawn.x + 2, room_spawn.y + 1),
         "Pioneer".to_string(),
         format!(
-            "Floor {} [{}]: Step on the yellow plate [o] or defeat the Floor Guardian to unseal the eastern gate.",
+            "Floor {} [{}]. The east gate yields to the yellow plate [o] or to the fall of its guardian.",
             floor_num, archetype_name
         ),
     ));

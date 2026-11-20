@@ -2,7 +2,7 @@ use crate::app::{
     AppState, InputMode, Screen, ServerBannerData, CLASS_PREVIEWS, TITLE_COLOR_ACCENT,
     TITLE_COLOR_MUTED,
 };
-use hyaku_protocol::{BossPhase, EnemyState, Position, Tile};
+use hyaku_protocol::{BossPhase, EnemyState, Position, RaidBoss, Tile, RANGER_CLASS};
 use ratatui::{
     layout::{Alignment, Constraint, Direction as LayoutDirection, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -10,6 +10,96 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Gauge, Paragraph, Wrap},
     Frame,
 };
+
+use std::time::{Duration, Instant};
+
+pub(crate) mod prologue;
+mod ending;
+mod raid_art;
+use raid_art::{mirror_wing, raid_sprite, raid_wings};
+pub(crate) use ending::ENDING_DURATION;
+
+#[derive(Clone, Copy)]
+pub(crate) enum BurstKind {
+    Enemy,
+    Shards,
+    Shrine,
+}
+
+impl BurstKind {
+    fn motion(self) -> (usize, f32, f32, (u8, u8, u8)) {
+        match self {
+            Self::Enemy => (12, 10.0, 0.48, (255, 116, 76)),
+            Self::Shards => (9, 7.0, 0.40, (255, 206, 96)),
+            Self::Shrine => (24, 12.0, 0.78, (144, 238, 223)),
+        }
+    }
+}
+
+struct Burst {
+    origin: Position,
+    kind: BurstKind,
+    started: Instant,
+}
+
+#[derive(Default)]
+pub(crate) struct ParticleField {
+    bursts: Vec<Burst>,
+}
+
+impl ParticleField {
+    pub(crate) fn emit(&mut self, origin: Position, kind: BurstKind) {
+        if self.bursts.len() == 24 {
+            self.bursts.remove(0);
+        }
+        self.bursts.push(Burst { origin, kind, started: Instant::now() });
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.bursts.clear();
+    }
+
+    pub(crate) fn expire(&mut self, now: Instant) {
+        self.bursts.retain(|burst| now.duration_since(burst.started).as_secs_f32() < burst.kind.motion().2);
+    }
+
+    fn draw(&self, now: Instant, camera: (i32, i32), grid: &mut [Vec<(char, Style)>]) {
+        for burst in &self.bursts {
+            let (count, velocity, lifetime, (r, g, b)) = burst.kind.motion();
+            let elapsed = now.duration_since(burst.started).as_secs_f32();
+            if elapsed >= lifetime {
+                continue;
+            }
+            let age = elapsed / lifetime;
+            let glyph = if age < 0.24 { '*' } else if age < 0.56 { '+' } else { '.' };
+            let light = 1.0 - age * 0.70;
+            let color = Color::Rgb(
+                (f32::from(r) * light) as u8,
+                (f32::from(g) * light) as u8,
+                (f32::from(b) * light) as u8,
+            );
+            // Integrate an exponentially slowing launch, then give the embers a downward fall.
+            let travel = (1.0 - (-3.2 * elapsed).exp()) / 3.2 * velocity;
+            let fall = 3.2 * elapsed * elapsed;
+            let phase = burst.origin.x as f32 * 0.23 + burst.origin.y as f32 * 0.17;
+            for spoke in 0..count {
+                let angle = phase + std::f32::consts::TAU * spoke as f32 / count as f32;
+                let (sin, cos) = angle.sin_cos();
+                let speed = 0.62 + (spoke * 7 % 11) as f32 * 0.08;
+                let x = burst.origin.x + (cos * speed * travel).round() as i32 - camera.0;
+                let y = burst.origin.y + (sin * speed * travel * 0.64 + fall).round() as i32 - camera.1;
+                if x < 0 || y < 0 {
+                    continue;
+                }
+                if let Some(cell) = grid.get_mut(y as usize).and_then(|row| row.get_mut(x as usize)) {
+                    if !matches!(cell.0, '#' | '+' | 'o' | '═' | '☼' | '▲' | '♨' | '✉') {
+                        *cell = (glyph, cell.1.fg(color));
+                    }
+                }
+            }
+        }
+    }
+}
 
 const DUSK: Color = Color::Rgb(19, 19, 23);
 const BRASS: Color = Color::Rgb(222, 183, 119);
@@ -183,7 +273,15 @@ pub fn render(frame: &mut Frame, app: &mut AppState) {
     match app.screen {
         Screen::TitleScreen => render_title_screen(frame, app),
         Screen::Connecting => render_connecting_screen(frame, app),
-        Screen::Connected => render_game_screen(frame, app),
+        Screen::Connected => {
+            if let Some(book) = &app.prologue {
+                book.render(frame);
+            } else if let Some(start) = app.ending_started {
+                ending::render(frame, start.elapsed());
+            } else {
+                render_game_screen(frame, app);
+            }
+        }
         Screen::Disconnected => render_disconnected_screen(frame, app),
     }
 }
@@ -440,7 +538,7 @@ fn render_game_screen(frame: &mut Frame, app: &mut AppState) {
 
     render_top_status_bar(frame, app, deck_layout[0]);
     if let Some(boss) = boss {
-        render_boss_bar(frame, boss, deck_layout[1]);
+        render_boss_bar(frame, boss, app.class_idx == RANGER_CLASS, deck_layout[1]);
     }
 
     let middle_layout = Layout::default()
@@ -466,6 +564,13 @@ fn render_game_screen(frame: &mut Frame, app: &mut AppState) {
     }
     if app.lore_open {
         render_lore(frame, app, area);
+    }
+    if app.victory_open {
+        render_result(frame, area, true);
+    } else if app.respawned_at.is_some()
+        && app.my_player().is_some_and(hyaku_protocol::PlayerState::is_alive)
+    {
+        render_result(frame, area, false);
     }
 }
 
@@ -535,16 +640,41 @@ fn render_lore(frame: &mut Frame, app: &AppState, area: Rect) {
     frame.render_widget(Paragraph::new(keys).centered().style(Style::default().fg(BRASS)), footer);
 }
 
-fn render_boss_bar(frame: &mut Frame, boss: &EnemyState, area: Rect) {
+fn render_boss_bar(frame: &mut Frame, boss: &EnemyState, ranged: bool, area: Rect) {
+    use RaidBoss::*;
+
+    let raid_boss = boss.raid_boss.unwrap_or(AshWarden);
+    let (barrage, tremor) = match raid_boss {
+        AshWarden => ("ASH SPIRAL", "ASHFALL"),
+        BellKeeper => ("DOUBLE TOLL", "FUNERAL PEAL"),
+        MireMatron => ("VENOM FAN", "BOG BLOOM"),
+        ChainKnight => ("IRON LANES", "CHAIN SWEEP"),
+        GlassRegent => ("SPLIT HALO", "SHATTER"),
+        HollowHuntsman => ("TRIPLE VOLLEY", "DEADFALL"),
+        LanternSaint => ("TWIN FLAMES", "RING OF WICKS"),
+        FrostReaver => ("ICE PINCERS", "RIME FIELD"),
+        CinderColossus => ("CINDER TIDE", "FAULT LINES"),
+        AshSovereign => ("CROWN OF ASH", "RUIN OF THE CROWN"),
+    };
     let (phase, color) = match boss.boss_phase {
-        Some(BossPhase::Barrage) => ("BARRAGE", Color::LightRed),
-        Some(BossPhase::Tremor) => ("TREMOR", Color::LightRed),
+        Some(BossPhase::Barrage) => (barrage, raid_boss_color(raid_boss)),
+        Some(BossPhase::Tremor) => (tremor, Color::LightRed),
         Some(BossPhase::Shielded) => ("SHIELD [Q] TETHER ACROSS", Color::Cyan),
         Some(BossPhase::Exposed) => ("SHIELD DOWN", Color::LightRed),
         None => return,
     };
-    let title = format!(" GATEKEEPER / {phase} ");
-    let hp = format!("{} / {}", boss.hp, boss.max_hp);
+    let name = boss.name().to_ascii_uppercase();
+    let title = format!(" {name} / {phase} ");
+    let hint = match boss.boss_phase {
+        Some(BossPhase::Shielded) => "Cross the boss with an ally or your solo decoy",
+        _ if ranged => "[Space] Shoot within 7 tiles of the body",
+        _ => "[Space] Slash within 2 tiles of the body",
+    };
+    let hp = if area.width >= 62 {
+        format!("{} / {}  ·  {hint}", boss.hp, boss.max_hp)
+    } else {
+        format!("{} / {}", boss.hp, boss.max_hp)
+    };
     let gauge = Gauge::default()
         .gauge_style(Style::default().fg(color).bg(Color::Rgb(39, 29, 38)))
         .ratio((f64::from(boss.hp) / f64::from(boss.max_hp.max(1))).clamp(0.0, 1.0));
@@ -555,8 +685,25 @@ fn render_boss_bar(frame: &mut Frame, boss: &EnemyState, area: Rect) {
             area,
         );
     } else {
-        let label = format!("GATEKEEPER {phase} {}/{}", boss.hp, boss.max_hp);
+        let label = format!("{name} {phase} {}/{}", boss.hp, boss.max_hp);
         frame.render_widget(gauge.label(label), area);
+    }
+}
+
+fn raid_boss_color(boss: RaidBoss) -> Color {
+    use RaidBoss::*;
+
+    match boss {
+        AshWarden => Color::LightRed,
+        BellKeeper => Color::Rgb(211, 169, 102),
+        MireMatron => Color::Rgb(139, 182, 88),
+        ChainKnight => Color::Rgb(176, 185, 195),
+        GlassRegent => Color::Rgb(213, 177, 239),
+        HollowHuntsman => Color::Rgb(190, 137, 108),
+        LanternSaint => Color::Rgb(250, 210, 115),
+        FrostReaver => Color::Rgb(148, 205, 245),
+        CinderColossus => Color::Rgb(241, 129, 75),
+        AshSovereign => Color::Rgb(255, 194, 121),
     }
 }
 
@@ -582,7 +729,7 @@ fn render_top_status_bar(frame: &mut Frame, app: &AppState, area: Rect) {
         (0, 0, true)
     };
 
-    let shard_ratio = if shrine_goal == 0 {
+    let mut shard_ratio = if shrine_goal == 0 {
         if stairs_unlocked { 1.0 } else { 0.0 }
     } else {
         (shrine_cur as f64 / shrine_goal as f64).clamp(0.0, 1.0)
@@ -691,9 +838,18 @@ fn render_top_status_bar(frame: &mut Frame, app: &AppState, area: Rect) {
     ]);
     frame.render_widget(Paragraph::new(floor_line), cols[0]);
 
-    // Middle: Shrine [百] Shard Progress Gauge
-    let gauge_label = if app.current_floor % 10 == 0 && shrine_goal == 0 {
-        if stairs_unlocked { "Raid cleared".to_string() } else { "Stairs sealed".to_string() }
+    let raid = RaidBoss::for_floor(app.current_floor).is_some();
+    let gauge_label = if raid && is_gate_locked {
+        let held = app.tick_state.as_ref().map_or(0, |tick| {
+            tick.tiles_override.iter().filter(|(_, tile)| {
+                matches!(tile, Tile::PressurePlate { active: true, .. })
+            }).count()
+        });
+        let total = app.current_map.as_ref().map_or(2, |map| map.plates.len()).max(1);
+        shard_ratio = (held as f64 / total as f64).min(1.0);
+        format!("Plates {held}/{total}")
+    } else if raid {
+        if stairs_unlocked { "Raid cleared".to_string() } else { "Slay the boss".to_string() }
     } else if shrine_goal == 0 || stairs_unlocked {
         format!("Shrine [百]: UNLOCKED ({}/{} Shards)", shrine_cur, shrine_goal)
     } else {
@@ -746,7 +902,7 @@ fn render_top_status_bar(frame: &mut Frame, app: &AppState, area: Rect) {
             )
         },
         Span::styled(
-            if !stairs_unlocked && !is_gate_locked {
+            if !raid && !stairs_unlocked && !is_gate_locked {
                 // Gate is opened, guide player directly to the Shrine to unseal the stairs!
                 format!("Shrine:[{} {}m]", shrine_compass, shrine_dist)
             } else {
@@ -919,6 +1075,36 @@ fn render_camera_viewport(frame: &mut Frame, app: &mut AppState, area: Rect) {
             }
         }
 
+        if let Some(map) = &app.current_map {
+            for enemy in tick.enemies.iter().filter(|enemy| enemy.is_alive()) {
+                let (Some(boss), Some(phase)) = (enemy.raid_boss, enemy.boss_phase) else { continue };
+                let wings = raid_wings(boss, phase, tick.tick);
+                let (half_width, half_height) = boss.half_size();
+                let shade = match phase {
+                    BossPhase::Shielded => Color::Rgb(85, 156, 168),
+                    BossPhase::Exposed => Color::Rgb(154, 106, 83),
+                    _ => Color::Rgb(204, 160, 107),
+                };
+                for (row, line) in wings.iter().enumerate() {
+                    let dy = row as i32 - half_height;
+                    for (col, glyph) in line.chars().rev().enumerate().filter(|(_, ch)| *ch != ' ') {
+                        let dx = half_width + 1 + col as i32;
+                        for (dx, glyph) in [(-dx, glyph), (dx, mirror_wing(glyph))] {
+                            let pos = enemy.pos.add_offset(dx, dy);
+                            let (x, y) = app.world_to_screen(pos);
+                            if (0..inner_w).contains(&x) && (0..inner_h).contains(&y)
+                                && map.get_tile(pos) == Some(Tile::Floor)
+                                && !tick.tiles_override.iter().any(|(p, _)| *p == pos)
+                            {
+                                let cell = &mut grid[y as usize][x as usize];
+                                *cell = (glyph, cell.1.fg(shade));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         for carving in &tick.carvings {
             let (x, y) = app.world_to_screen(carving.pos);
             if (0..inner_w).contains(&x) && (0..inner_h).contains(&y) {
@@ -929,6 +1115,8 @@ fn render_camera_viewport(frame: &mut Frame, app: &mut AppState, area: Rect) {
                 );
             }
         }
+
+        app.particles.draw(Instant::now(), app.camera_offset, &mut grid);
 
         // 4. Render projectiles (directional melee slash arcs, arrows, aether shards, ether bolts)
         // Sort so slash arcs ('╱', '─', '│', '╲') render with priority over ground shard particles
@@ -978,7 +1166,7 @@ fn render_camera_viewport(frame: &mut Frame, app: &mut AppState, area: Rect) {
         for decoy in &tick.decoys {
             let (sx, sy) = app.world_to_screen(decoy.pos);
             if sx >= 0 && sx < inner_w && sy >= 0 && sy < inner_h {
-                let remaining_secs = (decoy.remaining_ticks + 19) / 20;
+                let remaining_secs = (u64::from(decoy.remaining_ticks) * hyaku_protocol::SERVER_TICK_MS).div_ceil(1000);
                 let pulse_fg = if (tick_counter / 2) % 2 == 0 {
                     Color::Rgb(100, 240, 255)
                 } else {
@@ -1020,14 +1208,27 @@ fn render_camera_viewport(frame: &mut Frame, app: &mut AppState, area: Rect) {
             }
             let (sx, sy) = app.world_to_screen(enemy.pos);
             if let Some(phase) = enemy.boss_phase {
-                let color = if phase == BossPhase::Shielded { Color::Cyan } else { Color::LightRed };
+                let boss = enemy.raid_boss.unwrap_or(RaidBoss::AshWarden);
+                let color = if phase == BossPhase::Shielded { Color::Cyan } else { raid_boss_color(boss) };
                 let style = Style::default().fg(color).bg(Color::Rgb(38, 24, 33)).add_modifier(Modifier::BOLD);
-                for (row, line) in [r"/^^^\", "|o#o|", r"\_V_/"].iter().enumerate() {
-                    let y = sy + row as i32 - 1;
+                let sprite = if enemy.raid_boss.is_some() {
+                    raid_sprite(boss, tick.tick)
+                } else {
+                    &[r"/^^^\", "|o#o|", r"\_V_/"]
+                };
+                let half_width = sprite[0].len() as i32 / 2;
+                let half_height = sprite.len() as i32 / 2;
+                for (row, line) in sprite.iter().enumerate() {
+                    let y = sy + row as i32 - half_height;
                     for (col, glyph) in line.chars().enumerate() {
-                        let x = sx + col as i32 - 2;
+                        let x = sx + col as i32 - half_width;
                         if (0..inner_w).contains(&x) && (0..inner_h).contains(&y) {
-                            grid[y as usize][x as usize] = (glyph, style);
+                            let ink = if matches!(glyph, 'o' | '*') && phase != BossPhase::Shielded {
+                                style.fg(Color::Rgb(255, 231, 174))
+                            } else {
+                                style
+                            };
+                            grid[y as usize][x as usize] = (glyph, ink);
                         }
                     }
                 }
@@ -1084,7 +1285,7 @@ fn render_camera_viewport(frame: &mut Frame, app: &mut AppState, area: Rect) {
                 };
 
                 if let Some(target_pos) = target_pos_opt {
-                    if p.is_alive() && p.pos.manhattan_distance(target_pos) <= 8 {
+                    if p.is_alive() && p.pos.manhattan_distance(target_pos) <= hyaku_protocol::tether_range(tick.floor) {
                         let line_points = bresenham_line(p.pos, target_pos);
                         for (idx, pt) in line_points.iter().enumerate() {
                             if *pt == p.pos || *pt == target_pos {
@@ -1112,6 +1313,7 @@ fn render_camera_viewport(frame: &mut Frame, app: &mut AppState, area: Rect) {
         }
 
         // 6. Render other players & local player with @username tags and temporary speech bubbles
+        let raid_in_progress = tick.enemies.iter().any(|enemy| enemy.raid_boss.is_some() && enemy.is_alive());
         for player in &tick.players {
             let (sx, sy) = app.world_to_screen(player.pos);
             let is_me = app.my_player_id.as_deref() == Some(&player.id);
@@ -1166,7 +1368,7 @@ fn render_camera_viewport(frame: &mut Frame, app: &mut AppState, area: Rect) {
                 let tag_start_x = (sx - tag_len / 2).max(0);
                 let tag_y = sy - 1;
 
-                if tag_y >= 0 && tag_y < inner_h {
+                if !(is_me && raid_in_progress) && tag_y >= 0 && tag_y < inner_h {
                     for (idx, ch) in tag.chars().enumerate() {
                         let cur_x = tag_start_x + idx as i32;
                         if cur_x >= 0 && cur_x < inner_w {
@@ -1908,35 +2110,29 @@ fn render_bottom_hud(frame: &mut Frame, app: &AppState, area: Rect) {
     frame.render_widget(mana_gauge, cols[1]);
 
     // Shards & Class details
-    let class_name = app.current_class_preset().name;
     let shards_line = Line::from(vec![
-        Span::raw("  Shards: "),
+        Span::raw("Shards "),
         Span::styled(
             format!("{}", my_shards),
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" | Bank: "),
-        Span::styled(
-            format!("{}", tower_bank),
-            Style::default().fg(Color::LightYellow),
-        ),
-        Span::raw(" | ["),
-        Span::styled(
-            format!("{} {}", app.last_dir.arrow_glyph(), class_name),
-            Style::default().fg(TITLE_COLOR_ACCENT).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" - Slash 2 tiles", Style::default().fg(Color::Gray)),
-        Span::raw("]"),
+        Span::styled(my_player.map_or_else(String::new, |p| {
+            format!("  Gear +{}  ATK {}", p.temper, p.attack_power())
+        }), Style::default().fg(TITLE_COLOR_ACCENT)),
+        Span::raw(format!("  {}  Bank {tower_bank}", app.last_dir.arrow_glyph())),
     ]);
     frame.render_widget(Paragraph::new(shards_line), cols[2]);
 
-    let keys = if inner.width >= 77 {
-        "[Tab] Lore  [M] Carve  [L] Praise  [C] Fire  [Space] Slash  [Q] Link  [E] Use"
-    } else {
-        "[Tab] Lore  [M] Carve  [L] Praise  [C] Fire"
+    let raid = RaidBoss::for_floor(app.current_floor).is_some();
+    let attack = if app.class_idx == RANGER_CLASS { "Shoot" } else { "Slash" };
+    let keys = match (raid, inner.width >= 77) {
+        (true, true) => "[Q] Link  [R] Decoy  [G] Temper at fire  [E] Use  [Tab] Lore",
+        (true, false) => "[Q] Link  [R] Decoy  [G] Temper",
+        (false, true) => "[E] Use  [G] Temper  [C] Fire  [M] Carve  [L] Praise  [Tab] Lore",
+        (false, false) => "[E] Use  [G] Temper  [Tab] Lore",
     };
     frame.render_widget(
-        Paragraph::new(keys).alignment(Alignment::Center).style(Style::default().fg(BRASS)),
+        Paragraph::new(format!("[Space] {attack}  {keys}")).alignment(Alignment::Center).style(Style::default().fg(BRASS)),
         rows[1],
     );
 }
@@ -1955,6 +2151,61 @@ fn format_mini_bar(cur: i32, max: i32, width: usize) -> (String, Color) {
     (format!("[{}{}]", "█".repeat(filled), "-".repeat(empty)), color)
 }
 
+fn render_result(frame: &mut Frame, area: Rect, victory: bool) {
+    let wide = area.width >= 42 && area.height >= 16;
+    let popup = area.centered(
+        Constraint::Length(area.width.min(60)),
+        Constraint::Length(if wide { 15 } else { 5 }),
+    );
+    let title = if victory { " THE SOVEREIGN HAS FALLEN " } else { " THE HEARTH REMEMBERS " };
+    let panel = tower_panel()
+        .title(title)
+        .style(Style::default().bg(Color::Rgb(29, 23, 24)));
+    let inner = panel.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(panel, popup);
+
+    let spark = [".", "*", "+", "*"][(frame.count() / 12) % 4];
+    let mut text = Vec::new();
+    if wide {
+        let art: &[&str] = if victory {
+            &[
+                r"                      /\                ",
+                r"                _    /  \    _          ",
+                r"               / \__/____\__/ \         ",
+                r"           ___/___|  |[]|  |___\___     ",
+                r"          /  . |[]|__|  |__|[]| .  \    ",
+                r"       __/_____|__| /____\ |__|_____\__ ",
+                r"      /__/___.-----'      '----.___\__\ ",
+                r"       _.._           __          _.._  ",
+            ]
+        } else {
+            &[
+                r"                  .      .              ",
+                r"                    . /                 ",
+                r"                   /\\/  .              ",
+                r"                  /   \\/               ",
+                r"                _/ /\\  \_              ",
+                r"              _/__/  \___\_             ",
+                r"             /_____====_____\           ",
+                r"             \_____\  /_____/           ",
+            ]
+        };
+        text.push(Line::styled(spark, Style::default().fg(BRASS)));
+        text.extend(art.iter().copied().map(|row| Line::styled(row, Style::default().fg(BRASS))));
+        text.push(Line::default());
+    }
+    if victory {
+        text.push(Line::raw("The hundredth floor is yours."));
+        text.push(Line::styled("[Enter] Stay  [Esc] Quit", Style::default().fg(BRASS)));
+    } else {
+        text.push(Line::raw("The ember held."));
+    }
+    frame.render_widget(Paragraph::new(text).centered().style(Style::default().fg(Color::Rgb(223, 210, 191))), inner);
+}
+
+pub(crate) const RESPAWN_OVERLAY: Duration = Duration::from_millis(1400);
+
 fn render_death_screen(frame: &mut Frame, area: Rect) {
     let art = area.width >= 38 && area.height >= 16;
     let popup = area.centered(
@@ -1966,7 +2217,7 @@ fn render_death_screen(frame: &mut Frame, area: Rect) {
     let ash = Color::Rgb(175, 158, 146);
     let ember = Color::Rgb(232, 116, 92);
     let mut lines = vec![Line::styled(
-        "F A L L E N",
+        "YOU HAVE FALLEN",
         Style::default().fg(ember).add_modifier(Modifier::BOLD),
     )];
     if art {
@@ -2116,7 +2367,7 @@ mod tests {
             let render_death = |frame: &mut Frame| render_death_screen(frame, frame.area());
             terminal.draw(render_death).unwrap();
             let death = read(&terminal);
-            assert!(death.contains("F A L L E N") && death.contains("[R] Respawn"));
+            assert!(death.contains("YOU HAVE FALLEN") && death.contains("[R] Respawn"));
             assert!(death.contains("[Q/Esc] Quit"));
             if width == 80 {
                 for _ in 0..12 {
@@ -2166,6 +2417,85 @@ mod tests {
     }
 
     #[test]
+    fn floor_snapshots_emit_bursts_and_particles_expire() {
+        let mut app = AppState::new("Alice".into(), "ws://localhost".into(), 0);
+        app.screen = Screen::Connected;
+        app.current_floor = 2;
+        let map = FloorMap::generate(42, 2);
+        let shrine = map.shrine_pos.unwrap();
+        let origin = shrine.add_offset(5, 0);
+        app.current_map = Some(map);
+        let mut tick = TickState {
+            tick: 1,
+            floor: 2,
+            players: vec![PlayerState::new("p1".into(), "Alice".into(), 0, origin, 2)],
+            enemies: vec![EnemyState::new(1, EnemyKind::Crawler, origin, 1.0)],
+            projectiles: Vec::new(),
+            tiles_override: Vec::new(),
+            carvings: Vec::new(),
+            tower_shards_bank: 0,
+            decoys: Vec::new(),
+            shrine_shards: 9,
+            shrine_goal: 10,
+            stairs_unlocked: false,
+        };
+        app.handle_server_packet(hyaku_protocol::ServerPacket::Tick(tick.clone()));
+        assert!(app.particles.bursts.is_empty());
+        tick.tick += 1;
+        tick.enemies.clear();
+        tick.players[0].shards += 2;
+        tick.shrine_shards = 10;
+        tick.stairs_unlocked = true;
+        app.handle_server_packet(hyaku_protocol::ServerPacket::Tick(tick.clone()));
+        app.handle_server_packet(hyaku_protocol::ServerPacket::Tick(tick));
+        assert!(matches!(app.particles.bursts.as_slice(),
+            [Burst { kind: BurstKind::Shards, .. }, Burst { kind: BurstKind::Shrine, .. },
+             Burst { kind: BurstKind::Enemy, .. }]
+        ));
+
+        let now = Instant::now();
+        let camera = (shrine.x - 3, shrine.y - 4);
+        let mut grid = vec![vec![(' ', Style::default()); 13]; 9];
+        grid[4][3].0 = '☼';
+        app.particles.draw(now + Duration::from_millis(250), camera, &mut grid);
+        assert!(grid.iter().flatten().filter(|cell| matches!(cell.0, '*' | '+' | '.')).count() > 4);
+        assert_eq!(grid[4][3].0, '☼');
+        app.particles.expire(now + Duration::from_secs(1));
+        assert!(app.particles.bursts.is_empty());
+    }
+
+    #[test]
+    fn summit_and_respawn_banners_fit_wide_and_compact_terminals() {
+        for (width, height) in [(80, 24), (30, 12)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            for (victory, title) in [(true, "THE SOVEREIGN HAS FALLEN"), (false, "THE HEARTH REMEMBERS")] {
+                terminal.draw(|frame| render_result(frame, frame.area(), victory)).unwrap();
+                let text: String = terminal.backend().buffer().content().iter().map(|cell| cell.symbol()).collect();
+                assert!(text.contains(title));
+                assert!(text.contains(if victory { "[Enter] Stay" } else { "The ember held." }));
+                if width == 80 {
+                    assert!(text.contains(if victory { "|[]|" } else { "====" }));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn raid_sprites_animate_inside_their_hitboxes() {
+        let mut sprites = std::collections::HashSet::new();
+        for floor in (10..=100).step_by(10) {
+            let boss = RaidBoss::for_floor(floor).unwrap();
+            let (half_width, half_height) = boss.half_size();
+            for tick in [0, 6, 12] {
+                let sprite = raid_sprite(boss, tick);
+                assert!(sprites.insert(sprite));
+                assert_eq!(sprite.len() as i32, 2 * half_height + 1);
+                assert!(sprite.iter().all(|row| row.is_ascii() && row.len() as i32 == 2 * half_width + 1), "{boss:?}: {sprite:?}");
+            }
+        }
+    }
+
+    #[test]
     fn raid_screen_draws_the_shield_cue_sprite_and_warning() {
         let map = FloorMap::generate(42, 10);
         let mut boss = map.initial_enemies.iter().find(|e| e.kind == EnemyKind::FloorBoss)
@@ -2200,10 +2530,10 @@ mod tests {
             let screen: String = terminal.backend().buffer().content().iter().map(|cell| cell.symbol()).collect();
             assert!(screen.contains("SHIELD [Q] TETHER ACROSS"), "{screen}");
             if height == 24 {
-                assert!(screen.contains("|o#o|"), "{screen}");
+                assert!(screen.contains("o<|#|>o"), "{screen}");
                 assert!(screen.contains('▓'), "{screen}");
             } else {
-                assert!(screen.contains("2100/2100"), "{screen}");
+                assert!(screen.contains("788/788"), "{screen}");
             }
         }
     }

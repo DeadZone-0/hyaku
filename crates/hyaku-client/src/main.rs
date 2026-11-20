@@ -1,5 +1,6 @@
 mod app;
 mod network;
+mod local_server;
 mod resume;
 mod sound;
 mod ui;
@@ -27,6 +28,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut server_url = default_server;
     let mut class_idx = 0;
     let mut muted = false;
+    let mut launch_local = false;
+    let mut auto_connect = false;
+    let mut raid_floor = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -40,15 +44,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                      OPTIONS:\n\
                        -u, --user <NAME>       Player username\n\
                        -s, --server <URL>      WebSocket server URL (default: Nest cloud server)\n\
-                       -c, --class <0-3>       Class selection (0: Striker, 1: Paladin, 2: Mage, 3: Rogue)\n\
+                       -c, --class <0-3>       Class selection (0: Blade, 1: Arcanist, 2: Ranger, 3: Architect)\n\
                        -l, --local             Connect to local development server (ws://127.0.0.1:3000/ws)\n\
+                           --local-server      Launch and join an isolated local server\n\
+                           --raid-floor <N>    Start a local solo raid on floor 10, 20, ... 100\n\
+                           --connect           Join immediately with the selected name and class\n\
                            --mute              Turn off sound and ambience\n\
                        -v, --version           Print version information\n\
                        -h, --help              Print this help message\n\
                      \n\
                      CONTROLS:\n\
                        [WASD] / [Arrows]       Move climber\n\
-                       [Space]                 Slash\n\
+                       [Space]                 Slash or shoot as Ranger\n\
                        [R]                     Deploy Holo-Decoy (20 Mana, holds pressure plates)\n\
                        [B] + [WASD]            Build Shard Bridge over Chasm (5 Shards)\n\
                        [E]                     Interact with shrines, stairs, or allies\n\
@@ -66,6 +73,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
             "--mute" => muted = true,
+            "--local-server" => launch_local = true,
+            "--raid-floor" => {
+                raid_floor = Some(args.next()
+                    .and_then(|floor| floor.parse::<u32>().ok())
+                    .filter(|floor| (10..=100).contains(floor) && floor % 10 == 0)
+                    .ok_or_else(|| io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--raid-floor needs a floor from 10 through 100 in steps of 10",
+                    ))?);
+                launch_local = true;
+            }
+            "--connect" => auto_connect = true,
             "--local" | "-l" => {
                 server_url = "ws://127.0.0.1:3000/ws".to_string();
             }
@@ -100,13 +119,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let local = if launch_local {
+        let server = local_server::LocalServer::start(raid_floor).await?;
+        server_url = server.url.clone();
+        auto_connect = true;
+        Some(server)
+    } else {
+        None
+    };
+
     let sound = if muted { None } else { sound::Sound::open() };
 
-    let resume_key = match resume::for_server(&server_url) {
-        Ok(key) => Some(key),
-        Err(error) => {
-            eprintln!("Could not load the resume key: {error}");
-            None
+    let resume_key = if launch_local {
+        None
+    } else {
+        match resume::for_server(&server_url) {
+            Ok(key) => Some(key),
+            Err(error) => {
+                eprintln!("Could not load the resume key: {error}");
+                None
+            }
         }
     };
 
@@ -117,7 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let app_result = run_app(&mut terminal, username, server_url, class_idx, sound, resume_key).await;
+    let app_result = run_app(&mut terminal, username, server_url, class_idx, sound, resume_key, auto_connect).await;
 
     // 3. Terminal restoration
     disable_raw_mode()?;
@@ -128,6 +160,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cursor::Show
     )?;
     terminal.show_cursor()?;
+    if let Some(server) = local {
+        server.stop().await;
+    }
 
     if let Err(err) = app_result {
         eprintln!("[HYAKU CLIENT ERROR] {}", err);
@@ -143,8 +178,12 @@ async fn run_app(
     class_idx: usize,
     mut sound: Option<sound::Sound>,
     resume_key: Option<ResumeKey>,
+    auto_connect: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut app = AppState::new(username, server_url, class_idx);
+    if auto_connect {
+        app.handle_key(event::KeyCode::Enter);
+    }
     let mut network_opt: Option<NetworkHandle> = None;
     let target_frame_duration = Duration::from_millis(16); // ~60 FPS
 
@@ -204,7 +243,7 @@ async fn run_app(
         app.tick_effects();
         let cue = app.sound_cue.take();
         if let Some(sound) = &mut sound {
-            sound.update(app.ambience_level(), cue, &app.milestone_cues);
+            sound.update(app.ambience_level(), app.raid_music_active(), cue, &app.milestone_cues);
         }
         app.milestone_cues.clear();
         terminal.draw(|f| ui::render(f, &mut app))?;

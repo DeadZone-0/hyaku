@@ -33,6 +33,8 @@ pub struct SavedCarving {
 pub struct SavedLocation {
     pub floor: u32,
     pub pos: Position,
+    #[serde(default)]
+    pub temper: u8,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,7 +83,6 @@ impl Database {
         Ok(Self { path: Some(path), saved })
     }
 
-    #[cfg(test)]
     pub fn memory(seed: u64) -> Self {
         Self { path: None, saved: Save { world_seed: Some(seed), ..Save::default() } }
     }

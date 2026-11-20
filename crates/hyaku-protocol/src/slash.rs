@@ -1,9 +1,37 @@
-use crate::{Direction, EnemyState, Position, Tile};
+use crate::{Direction, EnemyState, Position, Tile, BOW_RANGE, RANGER_CLASS};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlashTile {
     pub pos: Position,
     pub glyph: char,
+}
+
+pub fn basic_attack_tiles(
+    class_idx: usize,
+    origin: Position,
+    facing: Direction,
+    enemies: &[EnemyState],
+    tile_at: impl Fn(Position) -> Option<Tile>,
+) -> Vec<SlashTile> {
+    if class_idx != RANGER_CLASS {
+        return slash_tiles(origin, facing, enemies, tile_at);
+    }
+    let mut tiles = Vec::new();
+    let mut pos = origin;
+    for _ in 0..BOW_RANGE {
+        pos = pos.step(facing);
+        if matches!(tile_at(pos), None | Some(Tile::Wall | Tile::Gate { open: false, .. })) {
+            break;
+        }
+        tiles.push(SlashTile { pos, glyph: '·' });
+        if enemies.iter().any(|enemy| enemy.is_alive() && enemy.occupies(pos)) {
+            break;
+        }
+    }
+    if let Some(last) = tiles.last_mut() {
+        last.glyph = facing.arrow_glyph();
+    }
+    tiles
 }
 
 fn compute_directional_slash_arc(origin: Position, facing: Direction) -> [SlashTile; 4] {

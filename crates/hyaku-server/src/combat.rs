@@ -1,12 +1,10 @@
 use hyaku_protocol::{
-    slash_tiles, BossPhase, Direction, EnemyKind, EnemyState, FloorMap, PlayerState, Position, ProjectileState, Tile,
+    basic_attack_tiles, tether_range, BossPhase, Direction, EnemyKind, EnemyState, FloorMap, PlayerState, Position,
+    ProjectileState, Tile, RANGER_CLASS,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::collections::{HashMap, HashSet};
-
-/// Maximum distance (in tiles) allowed for an active Co-op Lightning Tether
-pub const TETHER_MAX_RANGE: u32 = 8;
 
 /// Continuous electric damage dealt each tick to any enemy intersecting the tether beam
 pub const TETHER_DAMAGE_PER_TICK: i32 = 6;
@@ -37,109 +35,106 @@ pub fn bresenham_line(start: Position, end: Position) -> Vec<Position> {
     points
 }
 
-/// Result of executing a directional melee slash attack
 #[derive(Debug, Default)]
-pub struct SlashResult {
+pub struct AttackResult {
     pub hit_count: usize,
     pub total_damage: i32,
     pub shards_dropped: u32,
     pub announcements: Vec<String>,
-    pub slash_projectiles: Vec<(ProjectileState, u8)>,
+    pub projectiles: Vec<(ProjectileState, u8)>,
 }
 
-pub fn execute_directional_slash(
-    player_pos: Position,
-    player_name: &str,
+pub fn execute_basic_attack(
+    player: &PlayerState,
     dir: Direction,
-    class_idx: usize,
     tile_at: impl Fn(Position) -> Option<Tile>,
     enemies: &mut [EnemyState],
     tick_counter: u64,
-) -> SlashResult {
-    let class_preset = hyaku_protocol::get_class_preset(class_idx);
-    let base_dmg = class_preset.attack_power;
-    let arc_tiles = slash_tiles(player_pos, dir, enemies, tile_at);
+) -> AttackResult {
+    let class_preset = hyaku_protocol::get_class_preset(player.class_idx);
+    let player_name = &player.username;
+    let base_dmg = player.attack_power();
+    let tiles = basic_attack_tiles(player.class_idx, player.pos, dir, enemies, tile_at);
+    let ranged = player.class_idx == RANGER_CLASS;
 
     let mut hit_count = 0;
     let mut total_damage = 0;
     let mut shards_dropped = 0;
     let mut announcements = Vec::new();
-    let mut slash_projectiles = Vec::new();
+    let mut projectiles = Vec::new();
 
     let mut hit_gatekeeper = false;
-    for tile in arc_tiles {
-        slash_projectiles.push((
+    for tile in tiles {
+        projectiles.push((
             ProjectileState::new(tile.pos, tile.glyph, class_preset.color_rgb),
             3,
         ));
 
-        for enemy in enemies.iter_mut() {
-            if enemy.is_alive() && enemy.occupies(tile.pos) {
-                if enemy.kind == EnemyKind::FloorBoss {
-                    if hit_gatekeeper {
-                        continue;
-                    }
-                    hit_gatekeeper = true;
-                }
-
-                // Critical roll: 25% chance
-                let roll = ((tick_counter.wrapping_mul(7919))
-                    ^ ((tile.pos.x as u64).wrapping_mul(104729))
-                    ^ ((tile.pos.y as u64).wrapping_mul(31337))
-                    ^ (enemy.id as u64).wrapping_mul(61))
-                    % 100;
-                let is_crit = roll < 25;
-                let dmg = if is_crit {
-                    (base_dmg as f32 * 1.75).round() as i32
-                } else {
-                    base_dmg
-                };
-
-                let dealt = enemy.take_damage(dmg);
-                let damage = if enemy.kind == EnemyKind::FloorBoss { dealt } else { dmg };
-                if damage == 0 {
+        for enemy in enemies.iter_mut().filter(|e| e.is_alive() && e.occupies(tile.pos))
+            .take(if ranged { 1 } else { usize::MAX })
+        {
+            if enemy.kind == EnemyKind::FloorBoss {
+                if hit_gatekeeper {
                     continue;
                 }
-                hit_count += 1;
-                total_damage += damage;
+                hit_gatekeeper = true;
+            }
 
-                let enemy_name = enemy.kind.name();
-                if !enemy.is_alive() {
-                    let dropped = if enemy.is_boss {
-                        10
-                    } else if enemy.kind == EnemyKind::Brute {
-                        4
-                    } else {
-                        2
-                    };
-                    shards_dropped += dropped;
+            // Critical roll: 25% chance
+            let roll = ((tick_counter.wrapping_mul(7919))
+                ^ ((tile.pos.x as u64).wrapping_mul(104729))
+                ^ ((tile.pos.y as u64).wrapping_mul(31337))
+                ^ (enemy.id as u64).wrapping_mul(61))
+                % 100;
+            let is_crit = roll < 25;
+            let dmg = if is_crit {
+                (base_dmg as f32 * 1.75).round() as i32
+            } else {
+                base_dmg
+            };
 
-                    // Drop Aether Shards (*) at death position
-                    slash_projectiles.push((
-                        ProjectileState::new(tile.pos, '*', (255, 215, 0)),
-                        8,
-                    ));
-
-                    announcements.push(format!(
-                        ":: SLAIN :: {} swept through {}! (+{} Aether Shards dropped)",
-                        player_name, enemy_name, dropped
-                    ));
-                } else if is_crit {
-                    announcements.push(format!(
-                        ":: CRIT :: {}'s directional sweep struck {} for {} DMG!",
-                        player_name, enemy_name, damage
-                    ));
+            let dealt = enemy.take_damage(dmg);
+            let damage = if enemy.kind == EnemyKind::FloorBoss { dealt } else { dmg };
+            if damage == 0 {
+                if enemy.boss_phase == Some(BossPhase::Shielded) {
+                    announcements.push(format!("{} blocks the blow. Cross its body with [Q].", enemy.name()));
                 }
+                continue;
+            }
+            hit_count += 1;
+            total_damage += damage;
+
+            let enemy_name = enemy.name();
+            if !enemy.is_alive() {
+                let dropped = if enemy.is_boss {
+                    10
+                } else if enemy.kind == EnemyKind::Brute {
+                    4
+                } else {
+                    2
+                };
+                shards_dropped += dropped;
+
+                // Drop Aether Shards (*) at death position
+                projectiles.push((
+                    ProjectileState::new(tile.pos, '*', (255, 215, 0)),
+                    8,
+                ));
+
+                let verb = if ranged { "shot down" } else { "cut down" };
+                announcements.push(format!("{player_name} {verb} {enemy_name}. +{dropped} Shards"));
+            } else if is_crit {
+                announcements.push(format!(":: CRIT :: @{player_name} struck {enemy_name} for {damage} DMG."));
             }
         }
     }
 
-    SlashResult {
+    AttackResult {
         hit_count,
         total_damage,
         shards_dropped,
         announcements,
-        slash_projectiles,
+        projectiles,
     }
 }
 
@@ -153,17 +148,19 @@ pub struct TetherTickResult {
 }
 
 /// Processes continuous electric damage and spark particles for Co-op Lightning Tethers (`[Q]` key).
-/// Links players or decoys within 8 tiles and zaps any enemy intersecting the Bresenham line.
+/// Zaps enemies where a tether crosses their hitbox.
 pub fn process_continuous_tether_tick(
     players: &mut HashMap<String, PlayerState>,
     decoys: &[hyaku_protocol::DecoyState],
     enemies: &mut Vec<EnemyState>,
     tick_counter: u64,
+    raid: bool,
 ) -> TetherTickResult {
     let mut total_tether_damage = 0;
     let mut announcements = Vec::new();
     let mut spark_projectiles = Vec::new();
     let mut shards_earned: HashMap<String, u32> = HashMap::new();
+    let solo = raid && players.values().filter(|p| p.is_alive()).take(2).count() == 1;
 
     let mut processed_pairs: HashSet<(String, String)> = HashSet::new();
 
@@ -187,9 +184,10 @@ pub fn process_continuous_tether_tick(
         processed_pairs.insert(pair_key);
 
         // Target can be either another player or a player's Holo-Decoy (enables solo playtesting)
+        let range = tether_range(players[&p1_id].floor);
         let target_info = if let Some(p2) = players.get(&p2_id) {
-            if p2.is_alive() && p1_pos.manhattan_distance(p2.pos) <= TETHER_MAX_RANGE {
-                Some((p2.pos, p2.username.clone(), true))
+            if p2.is_alive() && p1_pos.manhattan_distance(p2.pos) <= range {
+                Some((p2.pos, p2.username.clone(), true, true))
             } else {
                 None
             }
@@ -197,13 +195,13 @@ pub fn process_continuous_tether_tick(
             let decoy_id = p2_id.trim_start_matches("decoy-").parse::<u64>().ok();
             decoys
                 .iter()
-                .find(|d| Some(d.id) == decoy_id && d.remaining_ticks > 0 && p1_pos.manhattan_distance(d.pos) <= TETHER_MAX_RANGE)
-                .map(|d| (d.pos, "Holo-Decoy §".to_string(), false))
+                .find(|d| Some(d.id) == decoy_id && d.remaining_ticks > 0 && p1_pos.manhattan_distance(d.pos) <= range)
+                .map(|d| (d.pos, "Holo-Decoy §".to_string(), false, solo && d.owner_name == p1_name))
         } else {
             None
         };
 
-        if let Some((p2_pos, p2_name, is_other_player)) = target_info {
+        if let Some((p2_pos, p2_name, is_other_player, breaks_shield)) = target_info {
             let line_points = bresenham_line(p1_pos, p2_pos);
 
             let interior = |pt: Position| pt != p1_pos && pt != p2_pos;
@@ -224,9 +222,9 @@ pub fn process_continuous_tether_tick(
                     continue;
                 };
                 if enemy.boss_phase == Some(BossPhase::Shielded) {
-                    if is_other_player {
+                    if breaks_shield {
                         enemy.boss_phase = Some(BossPhase::Exposed);
-                        announcements.push("Gatekeeper shield broken.".to_string());
+                        announcements.push(format!("{}'s shield breaks.", enemy.name()));
                     }
                     continue;
                 }
@@ -251,7 +249,7 @@ pub fn process_continuous_tether_tick(
                 ));
                 announcements.push(format!(
                     ":: AETHERIC ELECTROCUTION :: @{} & {} vaporized {} with the Lightning Tether! (+{} Shards dropped)",
-                    p1_name, p2_name, enemy.kind.name(), dropped
+                    p1_name, p2_name, enemy.name(), dropped
                 ));
             }
         }
@@ -501,7 +499,7 @@ mod tests {
     }
 
     #[test]
-    fn test_execute_directional_slash_cleaves_enemies_and_drops_shards() {
+    fn test_execute_basic_attack_cleaves_enemies_and_drops_shards() {
         let origin = Position::new(10, 10);
         let mut enemies = vec![
             EnemyState::new(1, EnemyKind::Crawler, Position::new(9, 9), 1.0),
@@ -510,11 +508,10 @@ mod tests {
         ];
 
         // Strike upwards in melee sweep
-        let res = execute_directional_slash(
-            origin,
-            "ZeHero",
+        let player = PlayerState::new("p1".into(), "Climber".into(), 0, origin, 1);
+        let res = execute_basic_attack(
+            &player,
             Direction::Up,
-            0, // Striker
             |_| Some(Tile::Floor),
             &mut enemies,
             100,
@@ -522,12 +519,45 @@ mod tests {
 
         assert_eq!(res.hit_count, 3, "Sweep arc must hit all 3 enemies in front");
         assert!(res.total_damage > 0);
-        assert_eq!(res.slash_projectiles.len() >= 3, true);
+        assert_eq!(res.projectiles.len() >= 3, true);
 
         // Verify slash arc glyphs generated
-        assert!(res.slash_projectiles.iter().any(|(p, _)| p.glyph == '╲'));
-        assert!(res.slash_projectiles.iter().any(|(p, _)| p.glyph == '─'));
-        assert!(res.slash_projectiles.iter().any(|(p, _)| p.glyph == '╱'));
+        assert!(res.projectiles.iter().any(|(p, _)| p.glyph == '╲'));
+        assert!(res.projectiles.iter().any(|(p, _)| p.glyph == '─'));
+        assert!(res.projectiles.iter().any(|(p, _)| p.glyph == '╱'));
+    }
+
+    #[test]
+    fn ranger_shots_hit_the_first_enemy_and_stop_at_cover() {
+        let origin = Position::new(10, 10);
+        let player = PlayerState::new("p1".into(), "Alice".into(), RANGER_CLASS, origin, 10);
+        let near = origin.add_offset(6, 0);
+        let far = origin.add_offset(7, 0);
+        let cover = origin.add_offset(3, 0);
+        let mut enemies = [
+            EnemyState::new(1, EnemyKind::Brute, near, 1.0),
+            EnemyState::new(2, EnemyKind::Brute, far, 1.0),
+        ];
+
+        for obstacle in [Tile::Wall, Tile::Gate { id: 1, open: false }] {
+            let shot = execute_basic_attack(&player, Direction::Right, |pos| {
+                Some(if pos == cover { obstacle } else { Tile::Floor })
+            }, &mut enemies, 100);
+            assert_eq!(shot.hit_count, 0);
+            assert!(shot.projectiles.iter().all(|(p, _)| p.pos.x < cover.x));
+        }
+
+        let shot = execute_basic_attack(&player, Direction::Right, |_| Some(Tile::Chasm), &mut enemies, 100);
+        assert_eq!(shot.hit_count, 1);
+        assert!(enemies[0].hp < enemies[0].max_hp);
+        assert_eq!(enemies[1].hp, enemies[1].max_hp);
+        assert_eq!(shot.projectiles.last().unwrap().0.pos, near);
+
+        enemies[0].hp = 0;
+        enemies[1].pos = origin.add_offset(8, 0);
+        let shot = execute_basic_attack(&player, Direction::Right, |_| Some(Tile::Floor), &mut enemies, 100);
+        assert_eq!(shot.hit_count, 0);
+        assert_eq!(shot.projectiles.last().unwrap().0.pos, far);
     }
 
     #[test]
@@ -539,16 +569,17 @@ mod tests {
             EnemyState::new(3, EnemyKind::Brute, origin, 1.0),
         ];
         let tile_at = |_| Some(Tile::Floor);
-        let slash = execute_directional_slash(
-            origin, "Alice", Direction::Up, 0, tile_at, &mut enemies, 100,
+        let player = PlayerState::new("p1".into(), "Alice".into(), 0, origin, 1);
+        let slash = execute_basic_attack(
+            &player, Direction::Up, tile_at, &mut enemies, 100,
         );
         assert_eq!(slash.hit_count, 2);
         assert_eq!(enemies[1].hp, enemies[1].max_hp);
 
         enemies[0].hp = 0;
         enemies[2].hp = 0;
-        let slash = execute_directional_slash(
-            origin, "Alice", Direction::Up, 0, tile_at, &mut enemies, 101,
+        let slash = execute_basic_attack(
+            &player, Direction::Up, tile_at, &mut enemies, 101,
         );
         assert_eq!(slash.hit_count, 1);
         assert!(enemies[1].hp < enemies[1].max_hp);
@@ -569,7 +600,7 @@ mod tests {
         enemy.hp = 5;
         let mut enemies = vec![enemy];
 
-        let result = process_continuous_tether_tick(&mut players, &[], &mut enemies, 1);
+        let result = process_continuous_tether_tick(&mut players, &[], &mut enemies, 1, false);
 
         assert_eq!(result.total_tether_damage, TETHER_DAMAGE_PER_TICK);
         assert!(!enemies[0].is_alive(), "Enemy must be slain by tether electric damage");
@@ -596,7 +627,7 @@ mod tests {
         enemy.hp = 5;
         let mut enemies = vec![enemy];
 
-        let result = process_continuous_tether_tick(&mut players, &decoys, &mut enemies, 1);
+        let result = process_continuous_tether_tick(&mut players, &decoys, &mut enemies, 1, false);
 
         assert_eq!(result.total_tether_damage, TETHER_DAMAGE_PER_TICK);
         assert!(!enemies[0].is_alive(), "Enemy must be slain by tether between player and decoy");

@@ -148,6 +148,10 @@ install_hyaku() {
     chmod +x "$BIN_PATH"
     info "Installing binary to ${INSTALL_DIR}/hyaku..."
     cp "$BIN_PATH" "${INSTALL_DIR}/hyaku"
+    SERVER_PATH="$(dirname "$BIN_PATH")/hyaku-server"
+    if [ -f "$SERVER_PATH" ]; then
+        install -m 755 "$SERVER_PATH" "$INSTALL_DIR/hyaku-local-server"
+    fi
 
     # Install companion auto-updater command
     cat << 'EOF' > "${INSTALL_DIR}/hyaku-update"
