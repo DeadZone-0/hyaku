@@ -126,7 +126,7 @@ pub fn parse_ascii_map(floor_num: u32, template: &str, width: i32, height: i32) 
                         ),
                         2 => (
                             "Ze",
-                            "Hall of Fame: Climber Ze forged the Hyaku engine and lit the first Beacon.",
+                            "Hall of Fame: Ze built the Hyaku engine and lit the first Beacon.",
                         ),
                         3 => (
                             "Vanguard",

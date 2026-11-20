@@ -15,25 +15,25 @@
 
 ## Quick Install (Linux & macOS)
 
-Install the latest release with a single command:
+Install the latest release.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/DeadZone-0/hyaku/main/install.sh | bash
 ```
 
-Once installed, simply run:
+Start the game.
 
 ```bash
 hyaku
 ```
 
-Or choose your climber name and hero class:
+You can also set your climber name and class at launch.
 
 ```bash
 hyaku -u "Aria" -c 0
 ```
 
-To auto-update Hyaku to the latest release at any time:
+Run the updater to get the latest release.
 
 ```bash
 hyaku-update

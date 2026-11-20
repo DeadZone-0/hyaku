@@ -181,9 +181,9 @@ mod tests {
         assert!(map.initial_carvings.len() >= 4, "Floor 1 must have Hall of Fame runestone carvings");
 
         // Verify Hall of Fame entries
-        let has_ze = map.initial_carvings.iter().any(|c| c.message.contains("Ze"));
+        let has_creator_credit = map.initial_carvings.iter().any(|c| c.author == "Ze");
         let has_ancients = map.initial_carvings.iter().any(|c| c.message.contains("Ancients") || c.message.contains("floors"));
-        assert!(has_ze && has_ancients);
+        assert!(has_creator_credit && has_ancients);
 
         // Verify gate and plate
         assert!(!map.gates.is_empty(), "Floor 1 has ceremonial barrier gate");

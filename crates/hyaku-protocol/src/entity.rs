@@ -12,7 +12,7 @@ pub struct PlayerClassPreset {
     pub attack_power: i32,
 }
 
-// TODO(ZE): Customize class glyphs, names, and RGB color palettes
+// TODO: Revise class glyphs, names, and colors.
 pub static PLAYER_CLASSES: &[PlayerClassPreset] = &[
     PlayerClassPreset {
         name: "Blade",

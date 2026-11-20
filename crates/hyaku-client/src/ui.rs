@@ -11,7 +11,7 @@ use ratatui::{
     Frame,
 };
 
-// TODO(ZE): Customize the 10 Stratum biome color palettes (Walls, Floors, Borders, Accents) and Shrine ASCII pedestal art
+// TODO: Revise the stratum palettes and shrine art.
 #[allow(dead_code)]
 pub const SHRINE_ASCII_PEDESTAL: &[&str] = &[
     "   ╔═════╗   ",

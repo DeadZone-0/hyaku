@@ -6,7 +6,7 @@ use hyaku_protocol::{
 use ratatui::style::Color;
 use std::collections::HashMap;
 
-// TODO(ZE): Customize HYAKU (百) multi-line ASCII title logo, class preview ASCII art, and title screen theme colors
+// TODO: Redraw the title banner and class previews, and revise the title colors.
 pub const TITLE_BANNER: &str = r#"
   ██╗  ██╗██╗   ██╗ █████╗ ██╗  ██╗██╗   ██╗    (百)
   ██║  ██║╚██╗ ██╔╝██╔══██╗██║ ██╔╝██║   ██║
@@ -52,7 +52,7 @@ pub const TITLE_COLOR_PRIMARY: Color = Color::Cyan;
 pub const TITLE_COLOR_ACCENT: Color = Color::Yellow;
 pub const TITLE_COLOR_MUTED: Color = Color::DarkGray;
 
-// TODO(ZE): Customize death screen ASCII banner and theme colors
+// TODO: Redraw the death banner and revise its colors.
 pub const DEATH_BANNER: &str = r#"
   ╦ ╦╔═╗╦ ╦  ╔╦╗╦╔═╗╔╦╗
   ╚╦╝║ ║║ ║   ║║║║╣  ║║
@@ -1295,12 +1295,12 @@ mod tests {
 
     #[test]
     fn test_client_side_prediction_and_reconciliation() {
-        let mut app = AppState::new("Ze".to_string(), "ws://127.0.0.1:3000/ws".to_string(), 0);
+        let mut app = AppState::new("Alice".to_string(), "ws://127.0.0.1:3000/ws".to_string(), 0);
         app.screen = Screen::Connected;
         app.my_player_id = Some("p-1".to_string());
         app.current_map = Some(FloorMap::generate(42, 1));
 
-        let p = PlayerState::new("p-1".to_string(), "Ze".to_string(), 0, Position::new(10, 10), 1);
+        let p = PlayerState::new("p-1".to_string(), "Alice".to_string(), 0, Position::new(10, 10), 1);
         app.tick_state = Some(TickState {
             tick: 1,
             floor: 1,
@@ -1344,12 +1344,12 @@ mod tests {
 
     #[test]
     fn test_damage_isolation_between_players() {
-        let mut app = AppState::new("Ze".to_string(), "ws://127.0.0.1:3000/ws".to_string(), 0);
+        let mut app = AppState::new("Alice".to_string(), "ws://127.0.0.1:3000/ws".to_string(), 0);
         app.screen = Screen::Connected;
         app.my_player_id = Some("p-1".to_string());
         app.current_map = Some(FloorMap::generate(42, 1));
 
-        let me = PlayerState::new("p-1".to_string(), "Ze".to_string(), 0, Position::new(10, 10), 1);
+        let me = PlayerState::new("p-1".to_string(), "Alice".to_string(), 0, Position::new(10, 10), 1);
         let mut ally = PlayerState::new("p-2".to_string(), "Bob".to_string(), 1, Position::new(20, 20), 1);
         ally.hp = 100;
         ally.max_hp = 100;
@@ -1378,12 +1378,10 @@ mod tests {
         // Local player screen must NOT flash red when a teammate takes damage
         assert_eq!(app.screen_flash, None, "Local screen must not flash red for teammate damage");
 
-        // Floating text for teammate damage must appear at Bob's position (20, 20), not Ze's position
         let bob_floater = app.floating_texts.iter().find(|ft| ft.text == "-15 HP");
         assert!(bob_floater.is_some(), "-15 HP floater must spawn");
         assert_eq!(bob_floater.unwrap().pos, Position::new(20, 20));
 
-        // Tick 3: Local player Ze takes 20 damage (HP: 120 -> 100).
         let mut tick_3 = app.tick_state.as_ref().unwrap().clone();
         tick_3.tick = 3;
         tick_3.players[0].hp = 100;
@@ -1392,8 +1390,8 @@ mod tests {
         // Local screen DOES flash red when local player takes damage
         assert_eq!(app.screen_flash, Some((Color::Red, 4)));
 
-        let ze_floater = app.floating_texts.iter().find(|ft| ft.text == "-20 HP");
-        assert!(ze_floater.is_some());
-        assert_eq!(ze_floater.unwrap().pos, Position::new(10, 10));
+        let local_floater = app.floating_texts.iter().find(|ft| ft.text == "-20 HP");
+        assert!(local_floater.is_some());
+        assert_eq!(local_floater.unwrap().pos, Position::new(10, 10));
     }
 }
