@@ -3,12 +3,28 @@ use crate::entity::{DecoyState, EnemyState, FloorCarving, PlayerState, Projectil
 use crate::position::Position;
 use crate::tile::Tile;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::fmt;
+
+pub type HallOfFame = BTreeMap<u32, String>;
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ResumeKey(pub String);
+
+impl fmt::Debug for ResumeKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ResumeKey(<redacted>)")
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientPacket {
     Join {
         username: String,
         class_idx: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resume_key: Option<ResumeKey>,
     },
     Move(Direction),
     Attack(Direction),
@@ -79,6 +95,10 @@ pub enum ServerPacket {
         map_seed: u64,
     },
     Tick(TickState),
+    HallOfFame {
+        highest_unlocked_floor: u32,
+        hall_of_fame: HallOfFame,
+    },
     FloorTransition {
         floor: u32,
         map_seed: u64,

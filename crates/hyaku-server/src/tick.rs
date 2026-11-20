@@ -33,6 +33,8 @@ pub async fn run_tick_loop(state: Arc<RwLock<ServerState>>) {
             floor_ticks.push((floor_num, tick_state, announcements));
         }
 
+        server.sync_progress();
+
         // Broadcast Tick packets and unseal announcements to respective floors
         for (floor_num, tick_state, announcements) in floor_ticks {
             server.broadcast_to_floor(floor_num, ServerPacket::Tick(tick_state));

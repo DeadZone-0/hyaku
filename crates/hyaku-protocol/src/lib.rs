@@ -18,7 +18,7 @@ pub use map_gen::{
     generate_floor_map_with_size, generate_procedural_floor, generate_static_floor_map,
     parse_ascii_map, SANCTUARY_LOBBY_ASCII,
 };
-pub use packet::{ClientPacket, ServerPacket, TickState};
+pub use packet::{ClientPacket, HallOfFame, ResumeKey, ServerPacket, TickState};
 pub use position::Position;
 pub use slash::{slash_tiles, SlashTile};
 pub use tile::Tile;
@@ -26,6 +26,21 @@ pub use tile::Tile;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn join_accepts_old_clients_and_redacts_resume_keys() {
+        let old = ClientPacket::from_json(r#"{"Join":{"username":"Alice","class_idx":0}}"#).unwrap();
+        assert!(matches!(old, ClientPacket::Join { resume_key: None, .. }));
+
+        let secret = "a".repeat(64);
+        let packet = ClientPacket::Join {
+            username: "Alice".into(),
+            class_idx: 0,
+            resume_key: Some(ResumeKey(secret.clone())),
+        };
+        assert_eq!(ClientPacket::from_json(&packet.to_json().unwrap()).unwrap(), packet);
+        assert!(!format!("{packet:?}").contains(&secret));
+    }
 
     #[test]
     fn test_direction_properties() {

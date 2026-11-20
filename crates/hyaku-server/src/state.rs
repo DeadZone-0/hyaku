@@ -1,10 +1,14 @@
 use crate::boss::BossRaid;
+use crate::db::{Database, FloorProgress, SavedCarving, SavedFloor, SavedLocation};
 use hyaku_protocol::{
     ClientPacket, DecoyState, Direction, EnemyKind, EnemyState, FloorCarving, FloorMap, PlayerState,
-    ProjectileState, ServerPacket, TickState, Tile, Position,
+    ProjectileState, ResumeKey, ServerPacket, TickState, Tile, Position,
 };
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::io;
+use std::path::PathBuf;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::UnboundedSender;
 
 /// Sanitizes user-supplied text to prevent ANSI escape sequence injection, terminal hijacking, and buffer bloat.
@@ -17,6 +21,20 @@ pub fn sanitize_text(input: &str, max_chars: usize) -> String {
         .trim()
         .to_string()
 }
+
+fn resume_id(name: &str, key: &ResumeKey) -> Option<String> {
+    if key.0.len() != 64 || !key.0.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"hyaku saved location v1\0");
+    hash.update(name.as_bytes());
+    hash.update([0]);
+    hash.update(key.0.as_bytes());
+    Some(format!("key:{:x}", hash.finalize()))
+}
+
+const LOCATION_CHECKPOINT: Duration = Duration::from_secs(5);
 
 pub struct FloorInstance {
     pub floor: u32,
@@ -79,6 +97,70 @@ impl FloorInstance {
             unlocked_gates: HashSet::new(),
             pending_announcements: Vec::new(),
         }
+    }
+
+    fn progress(&self) -> FloorProgress {
+        FloorProgress {
+            shrine_shards: self.shrine_shards,
+            stairs_unlocked: self.stairs_unlocked,
+            unlocked_gates: self.unlocked_gates.clone(),
+        }
+    }
+
+    fn restore(&mut self, saved: &SavedFloor, reached_next_floor: bool) {
+        self.shrine_shards = saved.progress.shrine_shards;
+        self.stairs_unlocked |= saved.progress.stairs_unlocked || reached_next_floor;
+        if reached_next_floor {
+            self.shrine_shards = self.shrine_shards.max(self.shrine_goal);
+        }
+        for &(id, pos) in &self.map.gates {
+            if saved.progress.unlocked_gates.contains(&id) || reached_next_floor {
+                self.tiles_override.insert(pos, Tile::Gate { id, open: true });
+                self.unlocked_gates.insert(id);
+            }
+        }
+        if self.floor % 10 == 0 && self.stairs_unlocked {
+            self.enemies.retain(|enemy| enemy.kind != EnemyKind::FloorBoss);
+        }
+
+        for &(pos, tile) in &saved.structures {
+            if matches!((self.map.get_tile(pos), tile),
+                (Some(Tile::Chasm), Tile::Bridge) | (Some(Tile::Floor), Tile::Campfire))
+            {
+                self.tiles_override.insert(pos, tile);
+            }
+        }
+        self.player_campfires.extend(saved.campfires_by_builder.iter()
+            .filter(|(_, pos)| self.tiles_override.get(pos) == Some(&Tile::Campfire))
+            .map(|(name, &pos)| (name.clone(), pos)));
+
+        for entry in &saved.carvings {
+            if self.map.get_tile(entry.carving.pos) != Some(Tile::Floor) {
+                continue;
+            }
+            if let Some(current) = self.carvings.iter_mut().find(|c| c.pos == entry.carving.pos) {
+                *current = entry.carving.clone();
+            } else {
+                self.carvings.push(entry.carving.clone());
+            }
+        }
+    }
+
+    fn respawn_position(&self, username: &str) -> Position {
+        self.player_campfires.get(&username.to_lowercase())
+            .copied()
+            .unwrap_or(self.map.spawn_pos)
+    }
+
+    fn saved_location(&self, player: &PlayerState) -> SavedLocation {
+        let pos = if player.is_alive() { player.pos } else { self.respawn_position(&player.username) };
+        SavedLocation { floor: self.floor, pos }
+    }
+
+    fn can_rejoin_at(&self, pos: Position) -> bool {
+        self.is_walkable(pos) && !self.enemies.iter().any(|enemy| {
+            enemy.kind == EnemyKind::FloorBoss && enemy.is_alive() && enemy.occupies(pos)
+        })
     }
 
     pub fn drain_announcements(&mut self) -> Vec<String> {
@@ -395,22 +477,17 @@ impl FloorInstance {
         let plate_events = self.check_pressure_plates();
         self.pending_announcements.extend(plate_events);
 
-        // Campfire & Shrine regeneration every 20 ticks (1 sec at 20-TPS)
-        if self.tick_counter % 20 == 0 {
-            for player in self.players.values_mut() {
-                if !player.is_alive() {
-                    continue;
-                }
-                match Self::resolve_tile(&self.map, &self.tiles_override, player.pos) {
-                    Some(Tile::Campfire) => {
-                        player.heal(6);
-                        player.restore_mana(6);
-                    }
-                    Some(Tile::Shrine) => {
-                        player.heal(player.max_hp);
-                        player.restore_mana(player.max_mana);
-                    }
-                    _ => {}
+        for player in self.players.values_mut().filter(|p| p.is_alive()) {
+            let tile_at = |pos| Self::resolve_tile(&self.map, &self.tiles_override, pos);
+            if self.tick_counter % 20 == 0 && tile_at(player.pos) == Some(Tile::Shrine) {
+                player.heal(player.max_hp);
+                player.restore_mana(player.max_mana);
+            } else if (-2..=2).any(|dy| {
+                (-2..=2).any(|dx| tile_at(player.pos.add_offset(dx, dy)) == Some(Tile::Campfire))
+            }) {
+                player.heal(1);
+                if self.tick_counter % 20 == 0 {
+                    player.restore_mana(6);
                 }
             }
         }
@@ -508,26 +585,113 @@ pub struct ServerState {
     pub floors: HashMap<u32, FloorInstance>,
     pub world_seed: u64,
     pub tower_shards_bank: u32,
+    db: Database,
+    progress_retry: Option<Instant>,
+    next_location_checkpoint: Instant,
+    pending_locations: HashMap<String, SavedLocation>,
+    resume_ids: HashMap<String, String>,
 }
 
 impl ServerState {
+    #[cfg(test)]
     pub fn new(seed: u64) -> Self {
+        Self::with_database(Database::memory(seed), seed)
+    }
+
+    pub fn load(seed: u64, save_path: PathBuf) -> io::Result<Self> {
+        Ok(Self::with_database(Database::load(save_path, seed)?, seed))
+    }
+
+    fn with_database(db: Database, seed: u64) -> Self {
         let mut state = Self {
             clients: HashMap::new(),
             client_floors: HashMap::new(),
             floors: HashMap::new(),
-            world_seed: seed,
-            tower_shards_bank: 0,
+            world_seed: db.saved().world_seed.unwrap_or(seed),
+            tower_shards_bank: db.saved().tower_shards_bank,
+            db,
+            progress_retry: None,
+            next_location_checkpoint: Instant::now() + LOCATION_CHECKPOINT,
+            pending_locations: HashMap::new(),
+            resume_ids: HashMap::new(),
         };
-        // Pre-create floor 1
-        state.floors.insert(1, FloorInstance::new(1, seed));
+        state.get_or_create_floor(1);
         state
     }
 
     pub fn get_or_create_floor(&mut self, floor: u32) -> &mut FloorInstance {
-        self.floors
-            .entry(floor)
-            .or_insert_with(|| FloorInstance::new(floor, self.world_seed))
+        self.floors.entry(floor).or_insert_with(|| {
+            let mut instance = FloorInstance::new(floor, self.world_seed);
+            let completed = floor < self.db.saved().highest_unlocked_floor;
+            if let Some(saved) = self.db.saved().floors.get(&floor) {
+                instance.restore(saved, completed);
+            } else if completed {
+                instance.restore(&SavedFloor::default(), true);
+            }
+            instance
+        })
+    }
+
+    pub fn sync_progress(&mut self) {
+        let now = Instant::now();
+        if self.progress_retry.is_some_and(|at| now < at) {
+            return;
+        }
+        if now >= self.next_location_checkpoint {
+            self.next_location_checkpoint = now + LOCATION_CHECKPOINT;
+            for floor in self.floors.values() {
+                self.pending_locations.extend(floor.players.values().filter_map(|player| {
+                    let id = self.resume_ids.get(&player.id)?;
+                    Some((id.clone(), floor.saved_location(player)))
+                }));
+            }
+        }
+        self.pending_locations.retain(|name, location| {
+            self.db.saved().last_locations.get(name) != Some(location)
+        });
+        let changed: Vec<_> = self.floors.iter().filter_map(|(&id, floor)| {
+            let progress = floor.progress();
+            let changed = match self.db.saved().floors.get(&id) {
+                Some(saved) => saved.progress != progress,
+                None => progress != FloorProgress::default(),
+            };
+            changed.then_some((id, progress))
+        }).collect();
+        if changed.is_empty() && self.pending_locations.is_empty() {
+            return;
+        }
+        if let Err(error) = self.db.update(|save| {
+            save.last_locations.extend(self.pending_locations.iter().map(|(name, &location)| {
+                (name.clone(), location)
+            }));
+            for (id, progress) in changed {
+                save.floors.entry(id).or_default().progress = progress;
+            }
+        }) {
+            eprintln!("[SAVE] World checkpoint: {error}");
+            self.progress_retry = Some(Instant::now() + Duration::from_secs(1));
+        } else {
+            self.pending_locations.clear();
+            self.progress_retry = None;
+        }
+    }
+
+    fn hall_of_fame_packet(&self) -> ServerPacket {
+        ServerPacket::HallOfFame {
+            highest_unlocked_floor: self.db.saved().highest_unlocked_floor,
+            hall_of_fame: self.db.saved().hall_of_fame.clone(),
+        }
+    }
+
+    fn tell(&self, player_id: &str, text: impl Into<String>) {
+        if let Some(tx) = self.clients.get(player_id) {
+            let _ = tx.send(ServerPacket::Announcement { text: text.into() });
+        }
+    }
+
+    fn save_failed(&self, player_id: &str, error: io::Error) {
+        eprintln!("[SAVE] {error}");
+        self.tell(player_id, "The tower could not save that change. Try again.");
     }
 
     pub fn register_client(&mut self, player_id: String, sender: UnboundedSender<ServerPacket>) {
@@ -536,9 +700,14 @@ impl ServerState {
 
     pub fn unregister_client(&mut self, player_id: &str) {
         self.clients.remove(player_id);
+        let resume_id = self.resume_ids.remove(player_id);
         if let Some(floor_num) = self.client_floors.remove(player_id) {
             if let Some(floor) = self.floors.get_mut(&floor_num) {
                 if let Some(player) = floor.remove_player(player_id) {
+                    if let Some(id) = resume_id {
+                        self.pending_locations.insert(id, floor.saved_location(&player));
+                        self.sync_progress();
+                    }
                     let msg = format!("{} left the floor.", player.username);
                     self.broadcast_to_floor(
                         floor_num,
@@ -566,9 +735,125 @@ impl ServerState {
         }
     }
 
+    fn light_campfire(&mut self, player_id: &str) {
+        const COST: u32 = 15;
+
+        let Some(&id) = self.client_floors.get(player_id) else { return };
+        let Some(floor) = self.floors.get_mut(&id) else { return };
+        let Some(player) = floor.players.get(player_id).filter(|p| p.is_alive()) else { return };
+        let pos = player.pos;
+        if floor.get_effective_tile(pos) != Some(Tile::Floor) || floor.carvings.iter().any(|c| c.pos == pos) {
+            self.tell(player_id, "A campfire needs a clear patch of stone.");
+            return;
+        }
+        if player.shards < COST {
+            self.tell(player_id, "You need 15 shards to kindle a campfire.");
+            return;
+        }
+        let name = player.username.clone();
+        let builder = name.to_lowercase();
+        if let Err(error) = self.db.update(|save| {
+            let saved = save.floors.entry(id).or_default();
+            saved.structures.push((pos, Tile::Campfire));
+            saved.campfires_by_builder.insert(builder.clone(), pos);
+        }) {
+            self.save_failed(player_id, error);
+            return;
+        }
+
+        floor.players.get_mut(player_id).unwrap().shards -= COST;
+        floor.tiles_override.insert(pos, Tile::Campfire);
+        floor.player_campfires.insert(builder, pos);
+        self.broadcast_to_floor(id, ServerPacket::Announcement {
+            text: format!("@{name} kindled a campfire. Rest near the embers."),
+        });
+    }
+
+    fn carve(&mut self, player_id: &str, message: &str) {
+        let message = sanitize_text(message, 80);
+        if message.is_empty() {
+            return;
+        }
+        let Some(&id) = self.client_floors.get(player_id) else { return };
+        let Some(floor) = self.floors.get_mut(&id) else { return };
+        let Some(player) = floor.players.get(player_id).filter(|p| p.is_alive()) else { return };
+        let pos = player.pos;
+        if floor.get_effective_tile(pos) != Some(Tile::Floor) || floor.carvings.iter().any(|c| c.pos == pos) {
+            self.tell(player_id, "Find bare stone to leave a carving.");
+            return;
+        }
+        let carving = FloorCarving::new(pos, player.username.clone(), message);
+        if let Err(error) = self.db.update(|save| {
+            save.floors.entry(id).or_default().carvings.push(SavedCarving {
+                carving: carving.clone(),
+                voters: Default::default(),
+            });
+        }) {
+            self.save_failed(player_id, error);
+            return;
+        }
+
+        floor.carvings.push(carving);
+        self.tell(player_id, "Your words are carved into the stone.");
+    }
+
+    fn upvote(&mut self, player_id: &str, pos: Position) {
+        const HEAL: i32 = 15;
+
+        let Some(&id) = self.client_floors.get(player_id) else { return };
+        let Some(floor) = self.floors.get_mut(&id) else { return };
+        let Some(player) = floor.players.get(player_id).filter(|p| p.is_alive()) else { return };
+        if player.pos.manhattan_distance(pos) > 2 {
+            return;
+        }
+        let Some(carving) = floor.carvings.iter_mut().find(|c| c.pos == pos) else { return };
+        let voter = player.username.to_lowercase();
+        let author = carving.author.to_lowercase();
+        if voter == author {
+            self.tell(player_id, "Only another climber can praise your carving.");
+            return;
+        }
+        if self.db.saved().floors.get(&id).is_some_and(|saved| {
+            saved.carvings.iter().any(|entry| entry.carving.pos == pos && entry.voters.contains(&voter))
+        }) {
+            self.tell(player_id, "You already praised this carving.");
+            return;
+        }
+        let mut updated = carving.clone();
+        updated.upvotes = updated.upvotes.saturating_add(1);
+        if let Err(error) = self.db.update(|save| {
+            let carvings = &mut save.floors.entry(id).or_default().carvings;
+            if let Some(entry) = carvings.iter_mut().find(|entry| entry.carving.pos == pos) {
+                entry.carving = updated.clone();
+                entry.voters.insert(voter);
+            } else {
+                carvings.push(SavedCarving { carving: updated.clone(), voters: [voter].into() });
+            }
+        }) {
+            self.save_failed(player_id, error);
+            return;
+        }
+        let name = updated.author.clone();
+        *carving = updated;
+
+        let healed = self.floors.values_mut().flat_map(|floor| floor.players.values_mut())
+            .find(|player| player.is_alive() && player.username.to_lowercase() == author)
+            .map(|player| {
+                player.heal(HEAL);
+                player.id.clone()
+            });
+        self.tell(player_id, format!("You praised @{name}'s carving."));
+        if let Some(author_id) = healed {
+            self.tell(&author_id, "A wandering climber praised your carving.");
+        }
+    }
+
     pub fn handle_packet(&mut self, player_id: &str, packet: ClientPacket) {
         match packet {
-            ClientPacket::Join { username, class_idx } => {
+            ClientPacket::Join { username, class_idx, resume_key } => {
+                if self.client_floors.contains_key(player_id) {
+                    return;
+                }
                 let clean_name = sanitize_text(&username, 24);
                 let username = if clean_name.is_empty() {
                     "Climber".to_string()
@@ -576,10 +861,28 @@ impl ServerState {
                     clean_name
                 };
 
-                let start_floor = 1;
+                let name = username.to_lowercase();
+                if self.floors.values().any(|floor| {
+                    floor.players.values().any(|player| player.username.to_lowercase() == name)
+                }) {
+                    if let Some(tx) = self.clients.get(player_id) {
+                        let _ = tx.send(ServerPacket::Error {
+                            message: "A climber with that name is already in the tower.".into(),
+                        });
+                    }
+                    return;
+                }
+                let resume_id = resume_key.as_ref().and_then(|key| resume_id(&name, key));
+                let saved = resume_id.as_ref().and_then(|id| {
+                    self.pending_locations.get(id).or_else(|| self.db.saved().last_locations.get(id))
+                }).copied()
+                    .filter(|location| (1..=self.db.saved().highest_unlocked_floor).contains(&location.floor));
+
+                let start_floor = saved.map_or(1, |location| location.floor);
                 let world_seed = self.world_seed;
                 let floor_inst = self.get_or_create_floor(start_floor);
-                let spawn_pos = floor_inst.map.spawn_pos;
+                let spawn_pos = saved.filter(|location| floor_inst.can_rejoin_at(location.pos))
+                    .map_or(floor_inst.map.spawn_pos, |location| location.pos);
 
                 let player = PlayerState::new(
                     player_id.to_string(),
@@ -591,6 +894,9 @@ impl ServerState {
 
                 floor_inst.add_player(player);
                 self.client_floors.insert(player_id.to_string(), start_floor);
+                if let Some(id) = resume_id {
+                    self.resume_ids.insert(player_id.to_string(), id);
+                }
 
                 if let Some(tx) = self.clients.get(player_id) {
                     let _ = tx.send(ServerPacket::Welcome {
@@ -598,6 +904,7 @@ impl ServerState {
                         floor: start_floor,
                         map_seed: world_seed,
                     });
+                    let _ = tx.send(self.hall_of_fame_packet());
                 }
 
                 let join_announcement = format!("{} entered floor {}!", username, start_floor);
@@ -1063,11 +1370,22 @@ impl ServerState {
                             } else {
                                 let deposit = amount.min(shards);
                                 if deposit > 0 {
+                                    let mut progress = floor.progress();
+                                    progress.shrine_shards = floor.shrine_shards.saturating_add(deposit);
+                                    progress.stairs_unlocked |= progress.shrine_shards >= floor.shrine_goal;
+                                    let bank = self.tower_shards_bank.saturating_add(deposit);
+                                    if let Err(error) = self.db.update(|save| {
+                                        save.floors.entry(floor_num).or_default().progress = progress;
+                                        save.tower_shards_bank = bank;
+                                    }) {
+                                        self.save_failed(player_id, error);
+                                        return;
+                                    }
                                     if let Some(p) = floor.players.get_mut(player_id) {
                                         p.shards -= deposit;
                                     }
-                                    floor.shrine_shards += deposit;
-                                    self.tower_shards_bank += deposit;
+                                    floor.shrine_shards = floor.shrine_shards.saturating_add(deposit);
+                                    self.tower_shards_bank = bank;
 
                                     println!(
                                         "[HYAKU SHRINE] Player '{}' deposited {} shards into Floor {} Shrine ({}/{} Shards). Bank: {}",
@@ -1140,6 +1458,13 @@ impl ServerState {
                                 } else {
                                     const BRIDGE_COST: u32 = 5;
                                     if shards >= BRIDGE_COST {
+                                        if let Err(error) = self.db.update(|save| {
+                                            save.floors.entry(floor_num).or_default()
+                                                .structures.push((target_pos, Tile::Bridge));
+                                        }) {
+                                            self.save_failed(player_id, error);
+                                            return;
+                                        }
                                         if let Some(p) = floor.players.get_mut(player_id) {
                                             p.shards -= BRIDGE_COST;
                                         }
@@ -1179,117 +1504,19 @@ impl ServerState {
                 }
             }
 
-            ClientPacket::LightCampfire => {
-                if let Some(&floor_num) = self.client_floors.get(player_id) {
-                    if let Some(floor) = self.floors.get_mut(&floor_num) {
-                        let player_info = floor.players.get(player_id).map(|p| {
-                            (p.pos, p.mana, p.shards, p.username.clone())
-                        });
-
-                        if let Some((pos, mana, shards, username)) = player_info {
-                            if let Some(Tile::Campfire) = floor.get_effective_tile(pos) {
-                                if let Some(tx) = self.clients.get(player_id) {
-                                    let _ = tx.send(ServerPacket::Announcement {
-                                        text: "You are already resting at a campfire!".to_string(),
-                                    });
-                                }
-                                return;
-                            }
-
-                            // Cost: 15 Mana or 2 Shards
-                            let mut paid = false;
-                            if let Some(p) = floor.players.get_mut(player_id) {
-                                if p.spend_mana(15) {
-                                    paid = true;
-                                } else if p.shards >= 2 {
-                                    p.shards -= 2;
-                                    paid = true;
-                                }
-                            }
-
-                            if paid {
-                                // Limit: 1 active campfire per player (replace previous)
-                                if let Some(old_pos) = floor.player_campfires.remove(player_id) {
-                                    floor.tiles_override.remove(&old_pos);
-                                }
-                                floor.tiles_override.insert(pos, Tile::Campfire);
-                                floor.player_campfires.insert(player_id.to_string(), pos);
-
-                                println!(
-                                    "[HYAKU ACTION] Player '{}' lit a resting campfire at ({}, {})",
-                                    username, pos.x, pos.y
-                                );
-                                self.broadcast_to_floor(
-                                    floor_num,
-                                    ServerPacket::Announcement {
-                                        text: format!(
-                                            "* [CO-OP] @{} kindled a resting Campfire! Rest nearby to recover HP and Mana! *",
-                                            username
-                                        ),
-                                    },
-                                );
-                            } else {
-                                if let Some(tx) = self.clients.get(player_id) {
-                                    let _ = tx.send(ServerPacket::Announcement {
-                                        text: format!("Need 15 Mana or 2 Shards to light a Campfire! (MP: {}, Shards: {})", mana, shards),
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            ClientPacket::CarveFloor { message } => {
-                if let Some(&floor_num) = self.client_floors.get(player_id) {
-                    if let Some(floor) = self.floors.get_mut(&floor_num) {
-                        if let Some(player) = floor.players.get(player_id) {
-                            let clean_msg = sanitize_text(&message, 80);
-                            if !clean_msg.is_empty() {
-                                let author = player.username.clone();
-                                let carving = FloorCarving::new(player.pos, author.clone(), clean_msg.clone());
-                                floor.carvings.push(carving);
-                                println!(
-                                    "[HYAKU CARVING] Player '{}' carved message at ({}, {}): '{}'",
-                                    author, player.pos.x, player.pos.y, clean_msg
-                                );
-                                if let Some(tx) = self.clients.get(player_id) {
-                                    let _ = tx.send(ServerPacket::Announcement {
-                                        text: "Etched a message into the ancient stone floor.".to_string(),
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            ClientPacket::UpvoteCarving { pos } => {
-                if let Some(&floor_num) = self.client_floors.get(player_id) {
-                    if let Some(floor) = self.floors.get_mut(&floor_num) {
-                        for carving in floor.carvings.iter_mut() {
-                            if carving.pos == pos {
-                                carving.upvotes = carving.upvotes.saturating_add(1);
-                                if let Some(tx) = self.clients.get(player_id) {
-                                    let _ = tx.send(ServerPacket::Announcement {
-                                        text: format!("Upvoted message by {} (now {} upvotes)", carving.author, carving.upvotes),
-                                    });
-                                }
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
+            ClientPacket::LightCampfire => self.light_campfire(player_id),
+            ClientPacket::CarveFloor { message } => self.carve(player_id, &message),
+            ClientPacket::UpvoteCarving { pos } => self.upvote(player_id, pos),
 
             ClientPacket::AscendStairs => {
                 if let Some(&current_floor) = self.client_floors.get(player_id) {
                     let mut player_opt = None;
                     let mut can_ascend = false;
+                    let mut discovered = false;
                     let mut rejection_msg = None;
 
                     if let Some(floor) = self.floors.get_mut(&current_floor) {
-                        if let Some(player) = floor.players.get(player_id) {
+                        if let Some(player) = floor.players.get(player_id).filter(|p| p.is_alive()) {
                             let tile = floor.get_effective_tile(player.pos);
                             if tile == Some(Tile::StairsUp) || player.pos == floor.map.stairs_pos {
                                 // Check if any Ascension Gate on this floor is still locked
@@ -1317,6 +1544,20 @@ impl ServerState {
                             }
                         }
                         if can_ascend {
+                            let next = (current_floor + 1).min(100);
+                            discovered = next > self.db.saved().highest_unlocked_floor;
+                            let author = floor.players[player_id].username.clone();
+                            let progress = floor.progress();
+                            if let Err(error) = self.db.update(|save| {
+                                save.floors.entry(current_floor).or_default().progress = progress;
+                                if discovered {
+                                    save.highest_unlocked_floor = next;
+                                    save.hall_of_fame.insert(next, author);
+                                }
+                            }) {
+                                self.save_failed(player_id, error);
+                                return;
+                            }
                             player_opt = floor.remove_player(player_id);
                         }
                     }
@@ -1347,6 +1588,10 @@ impl ServerState {
                                     message: transition_msg,
                                 });
                             }
+
+                            if discovered {
+                                self.broadcast_to_all(self.hall_of_fame_packet());
+                            }
                         }
                     }
                 }
@@ -1355,13 +1600,10 @@ impl ServerState {
             ClientPacket::Respawn => {
                 if let Some(&floor_num) = self.client_floors.get(player_id) {
                     if let Some(floor) = self.floors.get_mut(&floor_num) {
-                        let respawn_pos = floor
-                            .player_campfires
-                            .get(player_id)
-                            .copied()
-                            .unwrap_or(floor.map.spawn_pos);
-
                         let mut username = String::new();
+                        let respawn_pos = floor.players.get(player_id)
+                            .map(|player| floor.respawn_position(&player.username))
+                            .unwrap_or(floor.map.spawn_pos);
                         if let Some(player) = floor.players.get_mut(player_id) {
                             if !player.is_alive() {
                                 player.pos = respawn_pos;
@@ -1434,6 +1676,150 @@ mod tests {
     use super::*;
     use hyaku_protocol::Direction;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn structures_carvings_and_first_ascent_survive_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("hyaku_save.json");
+        let mut server = ServerState::load(42, path.clone()).unwrap();
+        for (id, name) in [("alice", "Alice"), ("bob", "Bob")] {
+            server.handle_packet(id, ClientPacket::Join { username: name.into(), class_idx: 0, resume_key: (id == "alice").then(|| ResumeKey("a".repeat(64))) });
+        }
+
+        let floor = server.floors.get_mut(&1).unwrap();
+        let mut open = (0..floor.map.height).flat_map(|y| (0..floor.map.width).map(move |x| Position::new(x, y)))
+            .filter(|&pos| floor.get_effective_tile(pos) == Some(Tile::Floor)
+                && floor.carvings.iter().all(|c| c.pos != pos));
+        let fire = open.next().unwrap();
+        let second_fire = open.next().unwrap();
+        let note = open.find(|pos| pos.chebyshev_distance(fire) > 2).unwrap();
+        let author = floor.players.get_mut("alice").unwrap();
+        author.pos = fire;
+        author.shards = 30;
+        server.handle_packet("alice", ClientPacket::LightCampfire);
+        let floor = server.floors.get_mut(&1).unwrap();
+        let author = floor.players.get_mut("alice").unwrap();
+        assert_eq!(author.shards, 15);
+        author.pos = second_fire;
+        server.handle_packet("alice", ClientPacket::LightCampfire);
+        let floor = server.floors.get_mut(&1).unwrap();
+        assert_eq!(floor.get_effective_tile(fire), Some(Tile::Campfire));
+        let near_fire = fire.all_neighbors().into_iter()
+            .find(|&pos| floor.get_effective_tile(pos) == Some(Tile::Floor))
+            .unwrap();
+        let reader = floor.players.get_mut("bob").unwrap();
+        reader.pos = near_fire;
+        reader.hp = 20;
+        floor.step_tick(0);
+        assert_eq!(floor.players["bob"].hp, 21);
+
+        let author = floor.players.get_mut("alice").unwrap();
+        author.pos = note;
+        author.hp = 20;
+        floor.players.get_mut("bob").unwrap().pos = note;
+        server.handle_packet("alice", ClientPacket::CarveFloor { message: "Mind the gate.".into() });
+        server.handle_packet("alice", ClientPacket::UpvoteCarving { pos: note });
+        server.handle_packet("bob", ClientPacket::UpvoteCarving { pos: note });
+        server.handle_packet("bob", ClientPacket::UpvoteCarving { pos: note });
+        assert_eq!(server.floors[&1].players["alice"].hp, 35);
+
+        let floor = server.floors.get_mut(&1).unwrap();
+        for &(gate, pos) in &floor.map.gates {
+            floor.tiles_override.insert(pos, Tile::Gate { id: gate, open: true });
+            floor.unlocked_gates.insert(gate);
+        }
+        floor.players.get_mut("alice").unwrap().pos = floor.map.stairs_pos;
+        server.handle_packet("alice", ClientPacket::AscendStairs);
+        assert_eq!(server.client_floors["alice"], 2);
+
+        let floor = server.floors.get_mut(&2).unwrap();
+        let author = floor.players.get_mut("alice").unwrap();
+        author.pos = floor.map.shrine_pos.unwrap();
+        let logout_pos = author.pos;
+        author.shards = 7;
+        server.handle_packet("alice", ClientPacket::DepositShards { amount: 7 });
+        server.unregister_client("alice");
+
+        let mut builder = server.floors.get_mut(&1).unwrap().remove_player("bob").unwrap();
+        let floor = server.get_or_create_floor(10);
+        let (origin, direction) = (0..floor.map.height)
+            .flat_map(|y| (0..floor.map.width).map(move |x| Position::new(x, y)))
+            .filter(|&pos| floor.get_effective_tile(pos) == Some(Tile::Floor))
+            .find_map(|pos| Direction::ALL.into_iter().find(|&dir| {
+                floor.get_effective_tile(pos.step(dir)) == Some(Tile::Chasm)
+            }).map(|dir| (pos, dir)))
+            .unwrap();
+        builder.floor = 10;
+        builder.pos = origin;
+        builder.shards = 5;
+        floor.add_player(builder);
+        server.client_floors.insert("bob".into(), 10);
+        server.handle_packet("bob", ClientPacket::BuildBridge(direction));
+        drop(server);
+
+        let mut restored = ServerState::load(7, path).unwrap();
+        assert_eq!(restored.world_seed, 42);
+        assert!(matches!(restored.hall_of_fame_packet(), ServerPacket::HallOfFame {
+            highest_unlocked_floor: 2, hall_of_fame,
+        } if hall_of_fame.get(&2).map(String::as_str) == Some("Alice")));
+        assert_eq!(restored.tower_shards_bank, 7);
+        assert_eq!(restored.get_or_create_floor(2).shrine_shards, 7);
+        for key in [None, Some(ResumeKey("b".repeat(64)))] {
+            restored.handle_packet("other", ClientPacket::Join {
+                username: "ALICE".into(),
+                class_idx: 0,
+                resume_key: key,
+            });
+            assert_eq!(restored.client_floors["other"], 1);
+            restored.unregister_client("other");
+        }
+        restored.handle_packet("returning", ClientPacket::Join { username: "ALICE".into(), class_idx: 0, resume_key: Some(ResumeKey("a".repeat(64))) });
+        assert_eq!(restored.client_floors["returning"], 2);
+        assert_eq!(restored.floors[&2].players["returning"].pos, logout_pos);
+        assert_eq!(restored.get_or_create_floor(10).get_effective_tile(origin.step(direction)), Some(Tile::Bridge));
+
+        restored.handle_packet("reader", ClientPacket::Join { username: "BOB".into(), class_idx: 0, resume_key: None });
+        let floor = restored.floors.get_mut(&1).unwrap();
+        assert_eq!(floor.get_effective_tile(fire), Some(Tile::Campfire));
+        assert_eq!(floor.get_effective_tile(second_fire), Some(Tile::Campfire));
+        assert_eq!(floor.player_campfires.get("alice"), Some(&second_fire));
+        assert!(floor.map.gates.iter().all(|&(id, pos)| floor.get_effective_tile(pos) == Some(Tile::Gate { id, open: true })));
+        floor.players.get_mut("reader").unwrap().pos = note;
+        restored.handle_packet("reader", ClientPacket::UpvoteCarving { pos: note });
+        let carving = restored.floors[&1].carvings.iter().find(|c| c.pos == note).unwrap();
+        assert_eq!((carving.message.as_str(), carving.upvotes), ("Mind the gate.", 1));
+    }
+
+    #[test]
+    fn reconnect_uses_the_last_checkpoint_or_the_floor_spawn() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("hyaku_save.json");
+        let mut server = ServerState::load(42, path.clone()).unwrap();
+        let join = ClientPacket::Join { username: "Alice".into(), class_idx: 0, resume_key: Some(ResumeKey("a".repeat(64))) };
+        server.handle_packet("first", join.clone());
+        server.handle_packet("duplicate", join.clone());
+        assert!(!server.client_floors.contains_key("duplicate"));
+
+        let floor = server.floors.get_mut(&1).unwrap();
+        let spawn = floor.map.spawn_pos;
+        let checkpoint = spawn.cardinal_neighbors().into_iter()
+            .find(|&pos| floor.is_walkable(pos))
+            .unwrap();
+        floor.players.get_mut("first").unwrap().pos = checkpoint;
+        server.next_location_checkpoint = Instant::now();
+        server.sync_progress();
+        drop(server);
+
+        let mut restored = ServerState::load(42, path.clone()).unwrap();
+        restored.handle_packet("returning", join.clone());
+        assert_eq!(restored.floors[&1].players["returning"].pos, checkpoint);
+        drop(restored);
+
+        let mut restored = ServerState::load(42, path).unwrap();
+        restored.floors.get_mut(&1).unwrap().tiles_override.insert(checkpoint, Tile::Wall);
+        restored.handle_packet("returning", join);
+        assert_eq!(restored.floors[&1].players["returning"].pos, spawn);
+    }
 
     #[test]
     fn gatekeeper_shield_requires_a_live_ally_and_defeat_opens_stairs() {
@@ -1528,6 +1914,7 @@ mod tests {
             ClientPacket::Join {
                 username: "Tester".to_string(),
                 class_idx: 1,
+                resume_key: None,
             },
         );
 
@@ -1578,6 +1965,7 @@ mod tests {
             ClientPacket::Join {
                 username: "Climber".to_string(),
                 class_idx: 0,
+                resume_key: None,
             },
         );
 
@@ -1666,6 +2054,7 @@ mod tests {
             ClientPacket::Join {
                 username: "Wizard".to_string(),
                 class_idx: 1, // Arcanist (120 Max Mana)
+                resume_key: None,
             },
         );
 
@@ -1706,6 +2095,7 @@ mod tests {
             ClientPacket::Join {
                 username: "Bob".to_string(),
                 class_idx: 0,
+                resume_key: None,
             },
         );
         let _ = rx.try_recv().expect("welcome");
@@ -1775,6 +2165,7 @@ mod tests {
             ClientPacket::Join {
                 username: "Hero".to_string(),
                 class_idx: 0,
+                resume_key: None,
             },
         );
         let _ = rx.try_recv().expect("welcome");

@@ -1,5 +1,6 @@
 mod boss;
 pub mod combat;
+mod db;
 mod state;
 mod tick;
 
@@ -42,7 +43,12 @@ async fn main() {
     println!("[HYAKU] Initializing authoritative world state...");
 
     let world_seed = 42424242;
-    let server_state = Arc::new(RwLock::new(ServerState::new(world_seed)));
+    let save_path = std::env::var_os("HYAKU_SAVE_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| "hyaku_save.json".into());
+    let saved = ServerState::load(world_seed, save_path.clone())
+        .unwrap_or_else(|error| panic!("load {}: {error}", save_path.display()));
+    let server_state = Arc::new(RwLock::new(saved));
 
     // Spawn 20-TPS authoritative game loop
     tokio::spawn(tick::run_tick_loop(server_state.clone()));

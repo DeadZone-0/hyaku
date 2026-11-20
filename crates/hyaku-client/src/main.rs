@@ -1,5 +1,6 @@
 mod app;
 mod network;
+mod resume;
 mod sound;
 mod ui;
 
@@ -10,7 +11,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use hyaku_protocol::ClientPacket;
+use hyaku_protocol::{ClientPacket, ResumeKey};
 use network::NetworkHandle;
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io::{self, Stdout};
@@ -47,13 +48,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                      \n\
                      CONTROLS:\n\
                        [WASD] / [Arrows]       Move climber\n\
-                       [Space]                 Attack / Interact\n\
+                       [Space]                 Slash\n\
                        [R]                     Deploy Holo-Decoy (20 Mana, holds pressure plates)\n\
                        [B] + [WASD]            Build Shard Bridge over Chasm (5 Shards)\n\
-                       [E]                     Deposit Shards at Shrine [百]\n\
-                       [T] / [Enter]           Open Tower Comms (Chat)\n\
+                       [E]                     Interact with shrines, stairs, or allies\n\
+                       [Enter]                 Open Tower Comms\n\
                        [Esc]                   Cancel / Menu\n\
-                       [Q]                     Ascend unlocked stairs\n"
+                       [Q]                     Link Lightning Tether\n\
+                       [C]                     Kindle campfire (15 Shards)\n\
+                       [M] / [L]               Carve / praise a message\n\
+                       [Tab]                   Hall of Fame & Lore\n"
                 );
                 return Ok(());
             }
@@ -98,6 +102,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let sound = if muted { None } else { sound::Sound::open() };
 
+    let resume_key = match resume::for_server(&server_url) {
+        Ok(key) => Some(key),
+        Err(error) => {
+            eprintln!("Could not load the resume key: {error}");
+            None
+        }
+    };
+
     // 2. Terminal setup
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -105,7 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let app_result = run_app(&mut terminal, username, server_url, class_idx, sound).await;
+    let app_result = run_app(&mut terminal, username, server_url, class_idx, sound, resume_key).await;
 
     // 3. Terminal restoration
     disable_raw_mode()?;
@@ -130,6 +142,7 @@ async fn run_app(
     server_url: String,
     class_idx: usize,
     mut sound: Option<sound::Sound>,
+    resume_key: Option<ResumeKey>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut app = AppState::new(username, server_url, class_idx);
     let mut network_opt: Option<NetworkHandle> = None;
@@ -148,6 +161,7 @@ async fn run_app(
                     app.queue_packet(ClientPacket::Join {
                         username: app.username.clone(),
                         class_idx: app.class_idx,
+                        resume_key: resume_key.clone(),
                     });
                 }
             }

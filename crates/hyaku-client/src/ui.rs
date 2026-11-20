@@ -464,6 +464,75 @@ fn render_game_screen(frame: &mut Frame, app: &mut AppState) {
     if let Some(ref banner) = app.server_banner {
         render_server_banner(frame, banner, area);
     }
+    if app.lore_open {
+        render_lore(frame, app, area);
+    }
+}
+
+fn render_lore(frame: &mut Frame, app: &AppState, area: Rect) {
+    let popup = area.centered(
+        Constraint::Length(area.width.min(56)),
+        Constraint::Length(area.height.min(26)),
+    );
+    let panel = tower_panel().title(" Hall of Fame & Lore ").style(Style::default().bg(DUSK));
+    let inner = panel.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(panel, popup);
+
+    let crest_height = if inner.height >= 12 { 4 } else { 0 };
+    let sections = Layout::vertical([
+        Constraint::Length(crest_height),
+        Constraint::Length(2),
+        Constraint::Min(0),
+        Constraint::Length(if inner.width >= 36 { 1 } else { 2 }),
+    ]).split(inner);
+    let crest = sections[0];
+    let header = sections[1];
+    let ledger = sections[2];
+    let footer = sections[3];
+
+    if crest_height > 0 {
+        let ember = [".", "*", "+", "*"][(frame.count() / 12) % 4];
+        let candles = Line::from(format!(r" {ember}    __/\__    {ember} "));
+        let art = vec![
+            candles,
+            Line::raw(r" |   /__\/__\   | "),
+            Line::raw(r" |   \__/ \_/   | "),
+        ];
+        frame.render_widget(Paragraph::new(art).centered().style(Style::default().fg(BRASS)), crest);
+    }
+
+    let highest = app.highest_unlocked_floor;
+    frame.render_widget(
+        Paragraph::new(format!("Highest floor reached  {highest}/100"))
+            .centered()
+            .style(Style::default().fg(BRASS)),
+        header,
+    );
+
+    let height = u32::from(ledger.height);
+    let selected = app.lore_floor;
+    let first = selected.saturating_sub(height.saturating_sub(1)).max(1);
+    let lines: Vec<_> = (first..=highest).take(ledger.height as usize).map(|floor| {
+        let name = app.hall_of_fame.get(&floor).map(String::as_str)
+            .unwrap_or(if floor == 1 { "Tower entrance" } else { "Unrecorded" });
+        let cursor = if floor == selected { '>' } else { ' ' };
+        let style = if floor == selected {
+            Style::default().fg(BRASS).bg(Color::Rgb(45, 34, 26))
+        } else {
+            Style::default().fg(Color::Rgb(210, 197, 176))
+        };
+        Line::styled(format!(" {cursor} F{floor:03}  {name} "), style)
+    }).collect();
+    frame.render_widget(Paragraph::new(lines), ledger);
+
+    let keys = if inner.width >= 36 {
+        "[↑/↓] Browse     [Tab/Esc] Close"
+    } else {
+        "[↑/↓] Browse
+[Tab/Esc] Close"
+    };
+    frame.render_widget(Paragraph::new(keys).centered().style(Style::default().fg(BRASS)), footer);
 }
 
 fn render_boss_bar(frame: &mut Frame, boss: &EnemyState, area: Rect) {
@@ -771,7 +840,7 @@ fn render_camera_viewport(frame: &mut Frame, app: &mut AppState, area: Rect) {
     let tick_counter = app.tick_state.as_ref().map(|t| t.tick).unwrap_or(0);
 
     // Dynamic landmarks for ambient atmosphere
-    let campfire_positions: Vec<Position> = app
+    let mut campfire_positions: Vec<Position> = app
         .tick_state
         .as_ref()
         .map(|tick| {
@@ -782,6 +851,12 @@ fn render_camera_viewport(frame: &mut Frame, app: &mut AppState, area: Rect) {
                 .collect()
         })
         .unwrap_or_default();
+    if let Some(map) = &app.current_map {
+        let width = map.width as usize;
+        campfire_positions.extend(map.tiles.iter().enumerate().filter_map(|(index, tile)| {
+            (*tile == Tile::Campfire).then(|| Position::new((index % width) as i32, (index / width) as i32))
+        }));
+    }
 
     let shrine_pos = app.current_map.as_ref().and_then(|m| m.shrine_pos);
     let stairs_pos = app.current_map.as_ref().map(|m| m.stairs_pos);
@@ -844,104 +919,14 @@ fn render_camera_viewport(frame: &mut Frame, app: &mut AppState, area: Rect) {
             }
         }
 
-        // 3. Render carvings with runic pulse and overhead preview if near
         for carving in &tick.carvings {
-            let (sx, sy) = app.world_to_screen(carving.pos);
-            if sx >= 0 && sx < inner_w && sy >= 0 && sy < inner_h {
-                // Ensure carvings never cover mechanical interactive tiles (plates, campfires, shrines, gates, stairs)
-                let is_interactive = tick.tiles_override.iter().any(|(p, t)| {
-                    *p == carving.pos
-                        && matches!(
-                            t,
-                            Tile::PressurePlate { .. }
-                                | Tile::Gate { .. }
-                                | Tile::Shrine
-                                | Tile::Campfire
-                                | Tile::StairsUp
-                        )
-                }) || app.current_map.as_ref().map_or(false, |m| {
-                    m.get_tile(carving.pos).map_or(false, |t| {
-                        matches!(
-                            t,
-                            Tile::PressurePlate { .. }
-                                | Tile::Gate { .. }
-                                | Tile::Shrine
-                                | Tile::Campfire
-                                | Tile::StairsUp
-                        )
-                    })
-                });
-
-                if !is_interactive {
-                    let pulse_fg = if (tick_counter / 3) % 2 == 0 {
-                        Color::Rgb(255, 230, 80)
-                    } else {
-                        Color::Rgb(255, 180, 40)
-                    };
-                    grid[sy as usize][sx as usize] = (
-                        '?',
-                        Style::default()
-                            .fg(pulse_fg)
-                            .bg(Color::Rgb(45, 35, 10))
-                            .add_modifier(Modifier::BOLD),
-                    );
-                }
-
-                let is_near = app
-                    .my_player()
-                    .map_or(false, |me| me.pos.manhattan_distance(carving.pos) <= 2);
-                if is_near && sy > 0 {
-                    let preview = format!(
-                        "[? @{}: \"{}\" (+{}U)]",
-                        carving.author, carving.message, carving.upvotes
-                    );
-                    let preview_len = preview.chars().count() as i32;
-                    let p_start_x = (sx - preview_len / 2).max(0);
-                    let p_y = sy - 1;
-                    if p_y >= 0 && p_y < inner_h {
-                        for (idx, ch) in preview.chars().enumerate() {
-                            let cur_x = p_start_x + idx as i32;
-                            if cur_x >= 0 && cur_x < inner_w {
-                                let target_world_pos = Position::new(
-                                    cur_x + app.camera_offset.0,
-                                    p_y + app.camera_offset.1,
-                                );
-                                let tile_is_interactive = app.current_map.as_ref().map_or(false, |m| {
-                                    m.get_tile(target_world_pos).map_or(false, |t| {
-                                        matches!(
-                                            t,
-                                            Tile::PressurePlate { .. }
-                                                | Tile::Gate { .. }
-                                                | Tile::Shrine
-                                                | Tile::Campfire
-                                                | Tile::StairsUp
-                                        )
-                                    })
-                                }) || tick.tiles_override.iter().any(|(p, t)| {
-                                    *p == target_world_pos
-                                        && matches!(
-                                            t,
-                                            Tile::PressurePlate { .. }
-                                                | Tile::Gate { .. }
-                                                | Tile::Shrine
-                                                | Tile::Campfire
-                                                | Tile::StairsUp
-                                        )
-                                });
-
-                                if !tile_is_interactive {
-                                    grid[p_y as usize][cur_x as usize] = (
-                                        ch,
-                                        Style::default()
-                                            .fg(Color::Rgb(255, 240, 150))
-                                            .bg(Color::Rgb(40, 30, 10))
-                                            .add_modifier(Modifier::BOLD),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
+            let (x, y) = app.world_to_screen(carving.pos);
+            if (0..inner_w).contains(&x) && (0..inner_h).contains(&y) {
+                let glow = if (tick_counter / 12) % 2 == 0 { BRASS } else { Color::Rgb(170, 131, 89) };
+                grid[y as usize][x as usize] = (
+                    '✉',
+                    Style::default().fg(glow).bg(Color::Rgb(45, 34, 23)),
+                );
             }
         }
 
@@ -1264,7 +1249,7 @@ fn render_camera_viewport(frame: &mut Frame, app: &mut AppState, area: Rect) {
                 let (x, y) = app.world_to_screen(me.pos.step(app.last_dir));
                 if (0..inner_w).contains(&x) && (0..inner_h).contains(&y) {
                     let cell = &mut grid[y as usize][x as usize];
-                    if cell.0 != '#' {
+                    if !matches!(cell.0, '#' | '+' | '▲' | '♨' | '☼' | '✉') {
                         *cell = (
                             app.last_dir.arrow_glyph(),
                             Style::default().fg(Color::Black).bg(BRASS).add_modifier(Modifier::BOLD),
@@ -1306,46 +1291,6 @@ fn render_camera_viewport(frame: &mut Frame, app: &mut AppState, area: Rect) {
         }
     }
 
-    // Overlay Runestone Carving Card if standing near a carved message
-    if let Some(carving) = app.nearby_carving() {
-        if inner_h >= 4 {
-            let row1 = inner_h - 2;
-            let row2 = inner_h - 1;
-
-            let header_str = format!(
-                " [ RUNESTONE CARVING by @{} | Upvotes: {} ] ",
-                carving.author, carving.upvotes
-            );
-            let msg_str = format!(" \"{}\"  --> Press [U] to Upvote ", carving.message);
-
-            for (i, ch) in header_str.chars().enumerate() {
-                let x = 2 + i as i32;
-                if x < inner_w {
-                    grid[row1 as usize][x as usize] = (
-                        ch,
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Rgb(255, 215, 60))
-                            .add_modifier(Modifier::BOLD),
-                    );
-                }
-            }
-
-            for (i, ch) in msg_str.chars().enumerate() {
-                let x = 2 + i as i32;
-                if x < inner_w {
-                    grid[row2 as usize][x as usize] = (
-                        ch,
-                        Style::default()
-                            .fg(Color::Rgb(255, 245, 180))
-                            .bg(Color::Rgb(50, 35, 10))
-                            .add_modifier(Modifier::BOLD),
-                    );
-                }
-            }
-        }
-    }
-
     // Convert grid buffer into lines for Ratatui Paragraph
     let lines: Vec<Line> = grid
         .into_iter()
@@ -1360,6 +1305,22 @@ fn render_camera_viewport(frame: &mut Frame, app: &mut AppState, area: Rect) {
 
     let map_p = Paragraph::new(lines);
     frame.render_widget(map_p, inner_area);
+    if let Some(carving) = app.nearby_carving().filter(|_| inner_area.height >= 4) {
+        let slip = Rect::new(inner_area.x, inner_area.bottom() - 3, inner_area.width, 3);
+        let text = vec![
+            Line::styled(
+                format!("[L] Praise  ·  @{}  ·  {}", carving.author, carving.upvotes),
+                Style::default().fg(BRASS).add_modifier(Modifier::BOLD),
+            ),
+            Line::raw(&carving.message),
+        ];
+        frame.render_widget(Clear, slip);
+        frame.render_widget(
+            Paragraph::new(text).wrap(Wrap { trim: true })
+                .style(Style::default().fg(Color::Rgb(225, 209, 186)).bg(Color::Rgb(44, 33, 25))),
+            slip,
+        );
+    }
 }
 
 fn tile_to_glyph_and_style(
@@ -1542,24 +1503,16 @@ fn tile_to_glyph_and_style(
         Tile::Bridge => (
             '═',
             Style::default()
-                .fg(Color::Rgb(240, 185, 95))
+                .fg(if (tick / 8) % 6 == 0 { Color::Rgb(238, 188, 115) } else { BRASS })
                 .bg(Color::Rgb(55, 35, 20))
                 .add_modifier(Modifier::BOLD),
         ),
         Tile::Campfire => {
-            const BRAILLE_FLAME: &[char] = &['⠂', '⠢', '⠶', '⣶', '⠿', '⠦', '⠔', '⠒'];
-            let glyph = BRAILLE_FLAME[(tick as usize / 2) % BRAILLE_FLAME.len()];
-            let fg_col = match (tick / 2) % 3 {
-                0 => Color::Rgb(255, 110, 20),
-                1 => Color::Rgb(255, 180, 40),
-                _ => Color::Rgb(255, 230, 70),
-            };
+            let ember = [Color::Rgb(227, 126, 66), BRASS, Color::Rgb(249, 193, 119)]
+                [(tick as usize / 7) % 3];
             (
-                glyph,
-                Style::default()
-                    .fg(fg_col)
-                    .bg(Color::Rgb(65, 22, 5))
-                    .add_modifier(Modifier::BOLD),
+                '♨',
+                Style::default().fg(ember).bg(Color::Rgb(54, 26, 18)).add_modifier(Modifier::BOLD),
             )
         }
     }
@@ -1864,19 +1817,19 @@ fn render_tower_comms(frame: &mut Frame, app: &AppState, area: Rect) {
             if let Some(carving) = app.nearby_carving() {
                 Line::from(vec![
                     Span::styled(
-                        format!("[U] Upvote @{}'s Runestone | ", carving.author),
+                        format!("[L] Praise @{} | ", carving.author),
                         Style::default()
                             .fg(Color::Yellow)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
-                        "[Enter] Chat | [F] Carve",
+                        "[Enter] Chat | [M] Carve",
                         Style::default().fg(Color::DarkGray),
                     ),
                 ])
             } else {
                 Line::from(Span::styled(
-                    "[Enter] to send chat | [F] carve message",
+                    "[Enter] Chat | [M] Carve",
                     Style::default().fg(Color::DarkGray),
                 ))
             }
@@ -1977,44 +1930,15 @@ fn render_bottom_hud(frame: &mut Frame, app: &AppState, area: Rect) {
     ]);
     frame.render_widget(Paragraph::new(shards_line), cols[2]);
 
-    // Keybindings hints
-    let mut hint_spans = vec![
-        Span::styled("[WASD]", Style::default().fg(TITLE_COLOR_ACCENT)),
-        Span::raw(" Move | "),
-        Span::styled("[Space]", Style::default().fg(TITLE_COLOR_ACCENT)),
-        Span::raw(" Slash Sweep | "),
-        Span::styled("[Q]", Style::default().fg(Color::Rgb(120, 240, 255)).add_modifier(Modifier::BOLD)),
-        Span::raw(" Tether ↯ (Ally/Decoy ≤8m) | "),
-        Span::styled("[R]", Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD)),
-        Span::raw(" Decoy | "),
-        Span::styled("[B]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::raw(" Bridge (5S) | "),
-        Span::styled("[E]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-        Span::raw(" Revive/Shrine/Ascend | "),
-    ];
-
-    if app.nearby_carving().is_some() {
-        hint_spans.push(Span::styled(
-            "[U] Runestone | ",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        ));
-    }
-
-    hint_spans.extend(vec![
-        Span::styled("[1-4]", Style::default().fg(Color::Rgb(80, 240, 255))),
-        Span::raw(" Callouts | "),
-        Span::styled("[C]", Style::default().fg(Color::Rgb(255, 140, 40))),
-        Span::raw(" Rest | "),
-        Span::styled("[Enter]", Style::default().fg(Color::White)),
-        Span::raw(" Chat | "),
-        Span::styled("[F]", Style::default().fg(Color::LightYellow)),
-        Span::raw(" Carve | "),
-        Span::styled("[Esc]", Style::default().fg(Color::Red)),
-        Span::raw(" Quit"),
-    ]);
-
-    let hints_line = Line::from(hint_spans);
-    frame.render_widget(Paragraph::new(hints_line).alignment(Alignment::Center), rows[1]);
+    let keys = if inner.width >= 77 {
+        "[Tab] Lore  [M] Carve  [L] Praise  [C] Fire  [Space] Slash  [Q] Link  [E] Use"
+    } else {
+        "[Tab] Lore  [M] Carve  [L] Praise  [C] Fire"
+    };
+    frame.render_widget(
+        Paragraph::new(keys).alignment(Alignment::Center).style(Style::default().fg(BRASS)),
+        rows[1],
+    );
 }
 
 fn format_mini_bar(cur: i32, max: i32, width: usize) -> (String, Color) {
@@ -2201,6 +2125,44 @@ mod tests {
                 assert_ne!(read(&terminal), death);
             }
         }
+    }
+
+    #[test]
+    fn lore_opens_scrolls_and_animates() {
+        let mut app = AppState::new("Alice".into(), "ws://localhost".into(), 0);
+        app.screen = Screen::Connected;
+        app.handle_server_packet(hyaku_protocol::ServerPacket::HallOfFame {
+            highest_unlocked_floor: 3,
+            hall_of_fame: [(2, "Alice".into()), (3, "Bob".into())].into(),
+        });
+        app.handle_key(crossterm::event::KeyCode::Tab);
+        assert!(app.lore_open);
+        assert_eq!(app.lore_floor, 3);
+        app.handle_key(crossterm::event::KeyCode::Up);
+        assert_eq!(app.lore_floor, 2);
+
+        for (width, height) in [(80, 24), (30, 12)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let draw = |frame: &mut Frame| render_lore(frame, &app, frame.area());
+            terminal.draw(draw).unwrap();
+            let read = |terminal: &Terminal<TestBackend>| {
+                terminal.backend().buffer().content().iter().map(|cell| cell.symbol()).collect::<String>()
+            };
+            let still = read(&terminal);
+            assert!(still.contains("Hall of Fame & Lore"));
+            assert!(still.contains("> F002  Alice") && still.contains("F003  Bob"));
+            assert!(still.contains("[Tab/Esc] Close"));
+            if width == 80 {
+                for _ in 0..12 {
+                    terminal.draw(draw).unwrap();
+                }
+                assert_ne!(read(&terminal), still);
+            }
+        }
+
+        app.handle_key(crossterm::event::KeyCode::Tab);
+        assert!(!app.lore_open);
+        assert!(!app.should_quit);
     }
 
     #[test]

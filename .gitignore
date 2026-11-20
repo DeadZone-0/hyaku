@@ -3,3 +3,5 @@
 .cargo/
 **/*.rs.bk
 Cargo.lock
+
+hyaku_save.json

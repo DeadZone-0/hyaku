@@ -67,7 +67,10 @@ An authoritative 24/7 game server is hosted on Hack Club Nest:
 | `[B]` + Direction | **Build Bridge** | Spend 5 Shards to permanently bridge an adjacent Chasm (`═`) for all players |
 | `[E]` | **Interact / Shrine** | Deposit shards into the Floor Shrine (`☼`), use stairs, or revive teammates |
 | `[T]` / `[Enter]` | **Tower Comms** | Open chat deck to message climbers on your floor |
-| `[K]` | **Carve Floor** | Carve a permanent message onto the floor tile |
+| `[C]` | **Kindle Campfire** | Spend 15 Shards to build a permanent campfire that heals nearby climbers |
+| `[M]` | **Carve Floor** | Leave a permanent message on bare stone |
+| `[L]` | **Praise Carving** | Upvote a nearby carving once and heal its living author |
+| `[Tab]` | **Hall of Fame & Lore** | Browse the first climber to reach each unlocked floor |
 | `[Esc]` | **Cancel / Back** | Close active prompt or cancel target selection |
 
 ---
@@ -99,6 +102,14 @@ cargo run -p hyaku-server
 # In another terminal, start client connecting to local server
 cargo run -p hyaku-client -- --local
 ```
+
+### World save
+
+The server writes `hyaku_save.json` in its working directory. Set `HYAKU_SAVE_PATH` to use another file. The save keeps floor unlocks, first climbers, shrine offerings, gates, bridges, campfires, carvings, and votes. Keep the file when moving the server.
+
+Reconnect with the same climber name and server address from the same client profile to resume your climb. The client creates a private resume key in its user data directory. The server saves your location on disconnect and checkpoints active climbers every five seconds.
+
+A climber using the same name from a different profile gets a separate location. Earlier name-only locations can't be carried over to a keyed profile.
 
 ### Run Tests
 ```bash

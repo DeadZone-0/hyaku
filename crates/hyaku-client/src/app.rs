@@ -1,7 +1,7 @@
 use crate::sound::Cue;
 use crossterm::event::KeyCode;
 use hyaku_protocol::{
-    get_class_preset, slash_tiles, ClientPacket, Direction, FloorCarving, FloorMap, PlayerState, Position,
+    get_class_preset, slash_tiles, ClientPacket, Direction, FloorCarving, FloorMap, HallOfFame, PlayerState, Position,
     ProjectileState, ServerPacket, SlashTile, TickState, PLAYER_CLASSES,
 };
 use ratatui::style::Color;
@@ -85,6 +85,10 @@ pub struct AppState {
     pub sound_cue: Option<Cue>,
     pub milestone_cues: Vec<Cue>,
     pub current_floor: u32,
+    pub highest_unlocked_floor: u32,
+    pub hall_of_fame: HallOfFame,
+    pub lore_open: bool,
+    pub lore_floor: u32,
     pub world_seed: u64,
     pub current_map: Option<FloorMap>,
     pub tick_state: Option<TickState>,
@@ -119,6 +123,10 @@ impl AppState {
             sound_cue: None,
             milestone_cues: Vec::new(),
             current_floor: 1,
+            highest_unlocked_floor: 1,
+            hall_of_fame: HallOfFame::new(),
+            lore_open: false,
+            lore_floor: 1,
             world_seed: 0,
             current_map: None,
             tick_state: None,
@@ -274,7 +282,8 @@ impl AppState {
         let tick = self.tick_state.as_ref()?;
         tick.carvings
             .iter()
-            .find(|c| c.pos == me.pos || me.pos.manhattan_distance(c.pos) <= 2)
+            .filter(|c| me.pos.manhattan_distance(c.pos) <= 2)
+            .min_by_key(|c| me.pos.manhattan_distance(c.pos))
     }
 
     pub fn update_camera(&mut self, viewport_w: i32, viewport_h: i32) {
@@ -305,6 +314,8 @@ impl AppState {
     pub fn handle_key(&mut self, key: KeyCode) {
         let screen = self.screen;
         let editing = self.title_edit_name;
+        let lore_open = self.lore_open;
+        let lore_floor = self.lore_floor;
         let class = self.class_idx;
         let name_len = self.username.len();
         match self.screen {
@@ -322,10 +333,10 @@ impl AppState {
             }
         }
 
-        let cue = if screen != self.screen || editing != self.title_edit_name {
+        let cue = if screen != self.screen || editing != self.title_edit_name || lore_open != self.lore_open {
             Some(Cue::MenuConfirm)
-        } else if screen == Screen::TitleScreen
-            && (class != self.class_idx || name_len != self.username.len())
+        } else if lore_floor != self.lore_floor
+            || (screen == Screen::TitleScreen && (class != self.class_idx || name_len != self.username.len()))
         {
             Some(Cue::MenuMove)
         } else {
@@ -384,6 +395,26 @@ impl AppState {
     }
 
     fn handle_connected_key(&mut self, key: KeyCode) {
+        if self.lore_open {
+            self.lore_floor = match key {
+                KeyCode::Up => self.lore_floor.saturating_sub(1).max(1),
+                KeyCode::Down => (self.lore_floor + 1).min(self.highest_unlocked_floor),
+                KeyCode::PageUp => self.lore_floor.saturating_sub(5).max(1),
+                KeyCode::PageDown => (self.lore_floor + 5).min(self.highest_unlocked_floor),
+                KeyCode::Esc | KeyCode::Tab => {
+                    self.lore_open = false;
+                    self.lore_floor
+                }
+                _ => self.lore_floor,
+            };
+            return;
+        }
+        if key == KeyCode::Tab && self.input_mode == InputMode::Normal {
+            self.lore_open = true;
+            self.lore_floor = self.highest_unlocked_floor;
+            return;
+        }
+
         if self.my_player().map_or(false, |p| !p.is_alive()) {
             self.input_mode = InputMode::Normal;
             match key {
@@ -416,7 +447,7 @@ impl AppState {
                     self.carving_input.pop();
                 }
                 KeyCode::Char(c) => {
-                    if self.carving_input.len() < 60 {
+                    if self.carving_input.chars().count() < 80 && !c.is_control() {
                         self.carving_input.push(c);
                     }
                 }
@@ -524,35 +555,14 @@ impl AppState {
             KeyCode::Enter => {
                 self.input_mode = InputMode::Chatting;
             }
-            KeyCode::Char('f') => {
+            KeyCode::Char('m') | KeyCode::Char('M') | KeyCode::Char('f') => {
                 self.input_mode = InputMode::CarvingMessage;
             }
-            KeyCode::Char('u') | KeyCode::Char('U') => {
-                let target_carving = if let (Some(me), Some(tick)) = (self.my_player(), &self.tick_state) {
-                    tick.carvings
-                        .iter()
-                        .find(|c| c.pos == me.pos || me.pos.manhattan_distance(c.pos) <= 2)
-                        .map(|c| (me.pos, c.pos, c.author.clone(), c.message.clone()))
+            KeyCode::Char('l') | KeyCode::Char('L') | KeyCode::Char('u') | KeyCode::Char('U') => {
+                if let Some(pos) = self.nearby_carving().map(|carving| carving.pos) {
+                    self.queue_packet(ClientPacket::UpvoteCarving { pos });
                 } else {
-                    None
-                };
-
-                if let Some((my_pos, c_pos, author, message)) = target_carving {
-                    self.spawn_floating_text(
-                        my_pos,
-                        "* APPRAISED +1 *".to_string(),
-                        Color::Yellow,
-                    );
-                    self.announcement = Some(format!(
-                        "Appraised message by @{}: \"{}\"",
-                        author, message
-                    ));
-                    self.queue_packet(ClientPacket::UpvoteCarving { pos: c_pos });
-                } else {
-                    self.announcement = Some(
-                        "No runestone carving nearby to read/upvote (stand within 2 steps of '?')"
-                            .to_string(),
-                    );
+                    self.announcement = Some("Stand within two steps of a carving to praise it.".into());
                 }
             }
             KeyCode::Char('1') => {
@@ -584,7 +594,7 @@ impl AppState {
                 }
             }
             KeyCode::Char('3') => {
-                let callout = "Rest by the Campfire [*] to heal!".to_string();
+                let callout = "Rest by the campfire [♨] to heal!".to_string();
                 self.speech_bubbles.insert(
                     self.username.clone(),
                     SpeechBubble {
@@ -634,7 +644,7 @@ impl AppState {
                 self.try_predict_move(Direction::Left);
                 self.queue_packet(ClientPacket::Move(Direction::Left));
             }
-            KeyCode::Right | KeyCode::Char('d') | KeyCode::Char('l') => {
+            KeyCode::Right | KeyCode::Char('d') => {
                 self.last_dir = Direction::Right;
                 self.try_predict_move(Direction::Right);
                 self.queue_packet(ClientPacket::Move(Direction::Right));
@@ -885,8 +895,17 @@ impl AppState {
                 self.current_floor = floor;
                 self.world_seed = map_seed;
                 self.current_map = Some(FloorMap::generate(map_seed, floor));
+                self.tick_state = None;
+                self.predicted_pos = None;
+                self.predicted_time = None;
                 self.screen = Screen::Connected;
+                self.lore_open = false;
                 self.announcement = Some(format!("Entered Floor {} of the Tower", floor));
+            }
+            ServerPacket::HallOfFame { highest_unlocked_floor, hall_of_fame } => {
+                self.highest_unlocked_floor = highest_unlocked_floor.clamp(1, 100);
+                self.lore_floor = self.lore_floor.clamp(1, self.highest_unlocked_floor);
+                self.hall_of_fame = hall_of_fame;
             }
             ServerPacket::Tick(mut state) => {
                 if self.current_floor != state.floor {
@@ -945,7 +964,7 @@ impl AppState {
                                     let hit = if new_player.is_alive() { Cue::Hurt } else { Cue::Fallen };
                                     cue = cue.max(Some(hit));
                                 }
-                            } else if new_player.hp > old_player.hp && old_player.hp > 0 {
+                            } else if new_player.hp - old_player.hp > 1 && old_player.hp > 0 {
                                 let heal = new_player.hp - old_player.hp;
                                 floaters.push((
                                     new_player.pos,
@@ -1058,6 +1077,9 @@ impl AppState {
             }
             ServerPacket::Error { message } => {
                 self.announcement = Some(format!("Error: {}", message));
+                if self.screen == Screen::Connecting {
+                    self.screen = Screen::Disconnected;
+                }
             }
             ServerPacket::Pong { .. } => {}
         }
@@ -1219,7 +1241,7 @@ mod tests {
         assert_eq!(carving.unwrap().author, "Aria");
 
         // Press 'U' to upvote
-        app.handle_key(KeyCode::Char('u'));
+        app.handle_key(KeyCode::Char('l'));
         assert_eq!(app.outbound_queue.len(), 1);
         match &app.outbound_queue[0] {
             ClientPacket::UpvoteCarving { pos } => {
