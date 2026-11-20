@@ -1,5 +1,6 @@
 mod app;
 mod network;
+mod sound;
 mod ui;
 
 use app::{AppState, Screen};
@@ -24,6 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "ws://[2a01:4f9:3080:3192::2124]:3000/ws".to_string());
     let mut server_url = default_server;
     let mut class_idx = 0;
+    let mut muted = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -39,6 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                        -s, --server <URL>      WebSocket server URL (default: Nest cloud server)\n\
                        -c, --class <0-3>       Class selection (0: Striker, 1: Paladin, 2: Mage, 3: Rogue)\n\
                        -l, --local             Connect to local development server (ws://127.0.0.1:3000/ws)\n\
+                           --mute              Turn off sound and ambience\n\
                        -v, --version           Print version information\n\
                        -h, --help              Print this help message\n\
                      \n\
@@ -58,6 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("hyaku v{}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
             }
+            "--mute" => muted = true,
             "--local" | "-l" => {
                 server_url = "ws://127.0.0.1:3000/ws".to_string();
             }
@@ -92,6 +96,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let sound = if muted { None } else { sound::Sound::open() };
+
     // 2. Terminal setup
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -99,7 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let app_result = run_app(&mut terminal, username, server_url, class_idx).await;
+    let app_result = run_app(&mut terminal, username, server_url, class_idx, sound).await;
 
     // 3. Terminal restoration
     disable_raw_mode()?;
@@ -123,6 +129,7 @@ async fn run_app(
     username: String,
     server_url: String,
     class_idx: usize,
+    mut sound: Option<sound::Sound>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut app = AppState::new(username, server_url, class_idx);
     let mut network_opt: Option<NetworkHandle> = None;
@@ -181,6 +188,11 @@ async fn run_app(
 
         // 5. Update active visual effects, camera & render frame
         app.tick_effects();
+        let cue = app.sound_cue.take();
+        if let Some(sound) = &mut sound {
+            sound.update(app.ambience_level(), cue, &app.milestone_cues);
+        }
+        app.milestone_cues.clear();
         terminal.draw(|f| ui::render(f, &mut app))?;
 
         // 6. Yield remaining frame time while listening for immediate input

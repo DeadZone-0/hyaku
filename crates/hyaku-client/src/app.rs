@@ -1,66 +1,43 @@
+use crate::sound::Cue;
 use crossterm::event::KeyCode;
 use hyaku_protocol::{
-    get_class_preset, ClientPacket, Direction, FloorCarving, FloorMap, PlayerState, Position,
-    ProjectileState, ServerPacket, TickState, PLAYER_CLASSES,
+    get_class_preset, slash_tiles, ClientPacket, Direction, FloorCarving, FloorMap, PlayerState, Position,
+    ProjectileState, ServerPacket, SlashTile, TickState, PLAYER_CLASSES,
 };
 use ratatui::style::Color;
 use std::collections::HashMap;
 
-// TODO: Redraw the title banner and class previews, and revise the title colors.
-pub const TITLE_BANNER: &str = r#"
-  ██╗  ██╗██╗   ██╗ █████╗ ██╗  ██╗██╗   ██╗    (百)
-  ██║  ██║╚██╗ ██╔╝██╔══██╗██║ ██╔╝██║   ██║
-  ███████║ ╚████╔╝ ███████║█████═╝ ██║   ██║    100-FLOOR CO-OP
-  ██╔══██║  ╚██╔╝  ██╔══██║██╔═██╗ ██║   ██║    TOWER ASCENSION
-  ██║  ██║   ██║   ██║  ██║██║ ╚██╗╚██████╔╝    TERMINAL CLIENT
-  ╚═╝  ╚═╝   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝
-"#;
-
-pub const CLASS_PREVIEWS: &[&str] = &[
-    // Blade
-    r#"
-       /| ________________
- O|===|* >________________>
-       \|
-    "#,
-    // Arcanist
-    r#"
-       / \
-      ( * )   < ether focus >
-       \ /
-        |
-        |
-    "#,
-    // Ranger
-    r#"
-      |\
-      | \
-      |  >======>>  [long range]
-      | /
-      |/
-    "#,
-    // Architect
-    r#"
-      [====]
-        ||
-      ======  [chasm builder]
-      | ## |
-    "#,
+pub const CLASS_PREVIEWS: &[&[&str]] = &[
+    &[
+        r"  |    __________/\ ",
+        r"==|==<___________/  ",
+        r"  |                 ",
+    ],
+    &[
+        r"        _/\_        ",
+        r"       { <> }       ",
+        r"        \||/        ",
+        r"         ||         ",
+        r"         ||         ",
+    ],
+    &[
+        r"        .-\         ",
+        r"       /   \        ",
+        r"      {----->-->    ",
+        r"       \   /        ",
+        r"        '-/         ",
+    ],
+    &[
+        r"     .--------.     ",
+        r"     |   ____  |*   ",
+        r"     '---|  |--'    ",
+        r"         |  |       ",
+        r"         |__|       ",
+    ],
 ];
 
-pub const TITLE_COLOR_PRIMARY: Color = Color::Cyan;
 pub const TITLE_COLOR_ACCENT: Color = Color::Yellow;
 pub const TITLE_COLOR_MUTED: Color = Color::DarkGray;
-
-// TODO: Redraw the death banner and revise its colors.
-pub const DEATH_BANNER: &str = r#"
-  ╦ ╦╔═╗╦ ╦  ╔╦╗╦╔═╗╔╦╗
-  ╚╦╝║ ║║ ║   ║║║║╣  ║║
-   ╩ ╚═╝╚═╝  ═╩╝╩╚═╝═╩╝
-  YOU HAVE FALLEN IN THE TOWER
-"#;
-pub const DEATH_COLOR_PRIMARY: Color = Color::Red;
-pub const DEATH_COLOR_ACCENT: Color = Color::DarkGray;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -105,6 +82,8 @@ pub struct AppState {
     pub server_url: String,
     pub class_idx: usize,
     pub my_player_id: Option<String>,
+    pub sound_cue: Option<Cue>,
+    pub milestone_cues: Vec<Cue>,
     pub current_floor: u32,
     pub world_seed: u64,
     pub current_map: Option<FloorMap>,
@@ -137,6 +116,8 @@ impl AppState {
             server_url,
             class_idx: valid_class,
             my_player_id: None,
+            sound_cue: None,
+            milestone_cues: Vec::new(),
             current_floor: 1,
             world_seed: 0,
             current_map: None,
@@ -262,46 +243,30 @@ impl AppState {
         }
     }
 
-    pub fn trigger_local_attack_fx(&mut self, dir: Direction) {
-        self.screen_flash = Some((Color::White, 2));
-        if let Some(player) = self.my_player() {
-            let origin = player.pos;
-            let (map_w, map_h) = self
-                .current_map
-                .as_ref()
-                .map(|m| (m.width, m.height))
-                .unwrap_or((80, 30));
-            let tiles = match dir {
-                Direction::Up => [
-                    (Position::new(origin.x - 1, origin.y - 1), '╱'),
-                    (Position::new(origin.x, origin.y - 1), '─'),
-                    (Position::new(origin.x + 1, origin.y - 1), '╲'),
-                ],
-                Direction::Down => [
-                    (Position::new(origin.x - 1, origin.y + 1), '╲'),
-                    (Position::new(origin.x, origin.y + 1), '─'),
-                    (Position::new(origin.x + 1, origin.y + 1), '╱'),
-                ],
-                Direction::Left => [
-                    (Position::new(origin.x - 1, origin.y - 1), '╲'),
-                    (Position::new(origin.x - 1, origin.y), '│'),
-                    (Position::new(origin.x - 1, origin.y + 1), '╱'),
-                ],
-                Direction::Right => [
-                    (Position::new(origin.x + 1, origin.y - 1), '╱'),
-                    (Position::new(origin.x + 1, origin.y), '│'),
-                    (Position::new(origin.x + 1, origin.y + 1), '╲'),
-                ],
-            };
-            if let Some(tick) = &mut self.tick_state {
-                for (pos, glyph) in tiles {
-                    if pos.in_bounds(map_w, map_h) {
-                        tick.projectiles
-                            .push(ProjectileState::new(pos, glyph, (255, 230, 100)));
-                    }
-                }
-            }
+    pub fn ambience_level(&self) -> f32 {
+        match self.screen {
+            Screen::TitleScreen => 1.0,
+            Screen::Connecting => 0.35,
+            Screen::Connected => match self.my_player() {
+                None => 0.35,
+                Some(player) if player.is_alive() && !self.tick_state.as_ref().is_some_and(raid_active) => 0.65,
+                _ => 0.0,
+            },
+            Screen::Disconnected => 0.0,
         }
+    }
+
+    pub fn attack_tiles(&self) -> Vec<SlashTile> {
+        let (Some(player), Some(tick)) = (self.my_player(), &self.tick_state) else {
+            return Vec::new();
+        };
+        if !player.is_alive() {
+            return Vec::new();
+        }
+        slash_tiles(player.pos, self.last_dir, &tick.enemies, |pos| {
+            tick.tiles_override.iter().find(|(p, _)| *p == pos).map(|(_, tile)| *tile)
+                .or_else(|| self.current_map.as_ref()?.get_tile(pos))
+        })
     }
 
     pub fn nearby_carving(&self) -> Option<&FloorCarving> {
@@ -338,6 +303,10 @@ impl AppState {
     }
 
     pub fn handle_key(&mut self, key: KeyCode) {
+        let screen = self.screen;
+        let editing = self.title_edit_name;
+        let class = self.class_idx;
+        let name_len = self.username.len();
         match self.screen {
             Screen::TitleScreen => self.handle_title_key(key),
             Screen::Connecting => {
@@ -352,6 +321,17 @@ impl AppState {
                 }
             }
         }
+
+        let cue = if screen != self.screen || editing != self.title_edit_name {
+            Some(Cue::MenuConfirm)
+        } else if screen == Screen::TitleScreen
+            && (class != self.class_idx || name_len != self.username.len())
+        {
+            Some(Cue::MenuMove)
+        } else {
+            None
+        };
+        self.sound_cue = self.sound_cue.max(cue);
     }
 
     fn handle_title_key(&mut self, key: KeyCode) {
@@ -404,6 +384,20 @@ impl AppState {
     }
 
     fn handle_connected_key(&mut self, key: KeyCode) {
+        if self.my_player().map_or(false, |p| !p.is_alive()) {
+            self.input_mode = InputMode::Normal;
+            match key {
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    self.queue_packet(ClientPacket::Respawn);
+                }
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    self.should_quit = true;
+                }
+                _ => {}
+            }
+            return;
+        }
+
         if self.input_mode == InputMode::CarvingMessage {
             match key {
                 KeyCode::Enter => {
@@ -459,20 +453,6 @@ impl AppState {
                     if self.chat_input.len() < 80 {
                         self.chat_input.push(c);
                     }
-                }
-                _ => {}
-            }
-            return;
-        }
-
-        // Dead player control: only Respawn or Quit
-        if self.my_player().map_or(false, |p| !p.is_alive()) {
-            match key {
-                KeyCode::Char('r') | KeyCode::Char('R') => {
-                    self.queue_packet(ClientPacket::Respawn);
-                }
-                KeyCode::Char('q') | KeyCode::Esc => {
-                    self.should_quit = true;
                 }
                 _ => {}
             }
@@ -660,14 +640,14 @@ impl AppState {
                 self.queue_packet(ClientPacket::Move(Direction::Right));
             }
             KeyCode::Char(' ') => {
-                let action_desc = match self.class_idx {
-                    0 => "Crescent Slash",
-                    1 => "Astral Lance",
-                    2 => "Gale Piercer",
-                    _ => "Adamantine Strike",
-                };
-                self.trigger_local_attack_fx(self.last_dir);
-                self.announcement = Some(format!("Striking with {} towards {}", action_desc, self.last_dir));
+                let tiles = self.attack_tiles();
+                let color = self.current_class_preset().color_rgb;
+                if let Some(tick) = &mut self.tick_state {
+                    tick.projectiles.extend(tiles.into_iter().map(|tile| {
+                        ProjectileState::new(tile.pos, tile.glyph, color)
+                    }));
+                }
+                self.sound_cue = self.sound_cue.max(Some(Cue::Swing));
                 self.queue_packet(ClientPacket::Attack(self.last_dir));
             }
             KeyCode::Char('r') | KeyCode::Char('R') | KeyCode::Char('x') => {
@@ -934,6 +914,16 @@ impl AppState {
                     }
                 }
 
+                if raid_active(&state)
+                    && !self.tick_state.as_ref().is_some_and(|old| old.floor == state.floor && raid_active(old))
+                {
+                    self.milestone_cues.push(Cue::Raid);
+                }
+                let mut cue = None;
+                let listener = state.players.iter()
+                    .find(|p| Some(p.id.as_str()) == self.my_player_id.as_deref() && p.is_alive())
+                    .map(|p| p.pos);
+
                 // 2. Track HP deltas between ticks for per-player damage feedback
                 let mut floaters: Vec<(Position, String, Color)> = Vec::new();
                 let mut local_took_damage = false;
@@ -952,6 +942,8 @@ impl AppState {
                                 // ONLY flash the screen red if the LOCAL player was damaged!
                                 if self.my_player_id.as_deref() == Some(&new_player.id) {
                                     local_took_damage = true;
+                                    let hit = if new_player.is_alive() { Cue::Hurt } else { Cue::Fallen };
+                                    cue = cue.max(Some(hit));
                                 }
                             } else if new_player.hp > old_player.hp && old_player.hp > 0 {
                                 let heal = new_player.hp - old_player.hp;
@@ -964,13 +956,27 @@ impl AppState {
                         }
                     }
 
-                    // Check enemies taking damage
-                    for new_enemy in &state.enemies {
-                        if let Some(old_enemy) = old_tick.enemies.iter().find(|e| e.id == new_enemy.id) {
-                            if new_enemy.hp < old_enemy.hp {
-                                let dmg = old_enemy.hp - new_enemy.hp;
+                    if old_tick.floor == state.floor {
+                        if state.shrine_goal > 0
+                            && old_tick.shrine_shards < state.shrine_goal
+                            && state.shrine_shards >= state.shrine_goal
+                            && state.stairs_unlocked
+                            && !old_tick.stairs_unlocked
+                        {
+                            self.milestone_cues.push(Cue::Shrine);
+                        }
+
+                        for old_enemy in &old_tick.enemies {
+                            let current = state.enemies.iter().find(|enemy| enemy.id == old_enemy.id);
+                            let hp = current.map_or(0, |enemy| enemy.hp);
+                            if hp < old_enemy.hp {
+                                let dmg = old_enemy.hp - hp;
+                                let pos = current.map_or(old_enemy.pos, |enemy| enemy.pos);
+                                if listener.is_some_and(|listener| listener.chebyshev_distance(pos) <= 5) {
+                                    cue = cue.max(Some(Cue::Impact));
+                                }
                                 floaters.push((
-                                    new_enemy.pos,
+                                    pos,
                                     format!("-{} DMG", dmg),
                                     Color::Rgb(255, 220, 60),
                                 ));
@@ -986,6 +992,7 @@ impl AppState {
                     self.screen_flash = Some((Color::Red, 4));
                 }
 
+                self.sound_cue = self.sound_cue.max(cue);
                 self.tick_state = Some(state);
             }
             ServerPacket::FloorTransition {
@@ -993,6 +1000,9 @@ impl AppState {
                 map_seed,
                 message,
             } => {
+                if floor > self.current_floor {
+                    self.milestone_cues.push(Cue::Ascend);
+                }
                 self.current_floor = floor;
                 self.world_seed = map_seed;
                 self.current_map = Some(FloorMap::generate(map_seed, floor));
@@ -1058,6 +1068,10 @@ impl AppState {
     }
 }
 
+fn raid_active(tick: &TickState) -> bool {
+    tick.enemies.iter().any(|enemy| enemy.is_alive() && enemy.boss_phase.is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1071,10 +1085,12 @@ mod tests {
         );
         assert_eq!(app.screen, Screen::TitleScreen);
         assert_eq!(app.class_idx, 0);
+        assert_eq!(app.ambience_level(), 1.0);
 
         // Move to next class
         app.handle_key(KeyCode::Right);
         assert_eq!(app.class_idx, 1);
+        assert_eq!(app.sound_cue.take(), Some(Cue::MenuMove));
 
         // Cycle through all
         app.handle_key(KeyCode::Left);
@@ -1083,8 +1099,10 @@ mod tests {
         // Edit name
         app.handle_key(KeyCode::Tab);
         assert!(app.title_edit_name);
+        assert_eq!(app.sound_cue.take(), Some(Cue::MenuConfirm));
         app.handle_key(KeyCode::Backspace);
         assert_eq!(app.username, "ZeHer");
+        assert_eq!(app.sound_cue.take(), Some(Cue::MenuMove));
         app.handle_key(KeyCode::Char('o'));
         assert_eq!(app.username, "ZeHero");
         app.handle_key(KeyCode::Enter);
@@ -1093,6 +1111,8 @@ mod tests {
         // Connect
         app.handle_key(KeyCode::Enter);
         assert_eq!(app.screen, Screen::Connecting);
+        assert_eq!(app.sound_cue.take(), Some(Cue::MenuConfirm));
+        assert!(app.ambience_level() < 1.0);
     }
 
     #[test]
@@ -1343,6 +1363,51 @@ mod tests {
     }
 
     #[test]
+    fn floor_and_shrine_cues_follow_confirmed_progress() {
+        let mut app = AppState::new("Alice".into(), "ws://localhost".into(), 0);
+        let mut tick = TickState {
+            tick: 1,
+            floor: 2,
+            players: Vec::new(),
+            enemies: Vec::new(),
+            projectiles: Vec::new(),
+            tiles_override: Vec::new(),
+            carvings: Vec::new(),
+            tower_shards_bank: 0,
+            decoys: Vec::new(),
+            shrine_shards: 9,
+            shrine_goal: 10,
+            stairs_unlocked: false,
+        };
+
+        app.handle_server_packet(ServerPacket::Tick(tick.clone()));
+        assert!(app.milestone_cues.is_empty());
+        tick.tick += 1;
+        tick.shrine_shards = 10;
+        tick.stairs_unlocked = true;
+        app.handle_server_packet(ServerPacket::Tick(tick.clone()));
+        tick.tick += 1;
+        app.handle_server_packet(ServerPacket::Tick(tick));
+        assert_eq!(app.milestone_cues, [Cue::Shrine]);
+
+        app.handle_server_packet(ServerPacket::FloorTransition {
+            floor: 10,
+            map_seed: 42,
+            message: "Ascended to Floor 10".into(),
+        });
+        let mut raid = app.tick_state.as_ref().unwrap().clone();
+        raid.floor = 10;
+        raid.shrine_goal = 0;
+        raid.shrine_shards = 0;
+        raid.stairs_unlocked = false;
+        raid.enemies = app.current_map.as_ref().unwrap().initial_enemies.clone();
+        app.handle_server_packet(ServerPacket::Tick(raid.clone()));
+        raid.stairs_unlocked = true;
+        app.handle_server_packet(ServerPacket::Tick(raid));
+        assert_eq!(app.milestone_cues, [Cue::Shrine, Cue::Ascend, Cue::Raid]);
+    }
+
+    #[test]
     fn test_damage_isolation_between_players() {
         let mut app = AppState::new("Alice".to_string(), "ws://127.0.0.1:3000/ws".to_string(), 0);
         app.screen = Screen::Connected;
@@ -1377,6 +1442,7 @@ mod tests {
 
         // Local player screen must NOT flash red when a teammate takes damage
         assert_eq!(app.screen_flash, None, "Local screen must not flash red for teammate damage");
+        assert_eq!(app.sound_cue, None);
 
         let bob_floater = app.floating_texts.iter().find(|ft| ft.text == "-15 HP");
         assert!(bob_floater.is_some(), "-15 HP floater must spawn");
@@ -1389,9 +1455,21 @@ mod tests {
 
         // Local screen DOES flash red when local player takes damage
         assert_eq!(app.screen_flash, Some((Color::Red, 4)));
+        assert_eq!(app.sound_cue.take(), Some(Cue::Hurt));
 
         let local_floater = app.floating_texts.iter().find(|ft| ft.text == "-20 HP");
         assert!(local_floater.is_some());
         assert_eq!(local_floater.unwrap().pos, Position::new(10, 10));
+
+        let mut fallen = app.tick_state.as_ref().unwrap().clone();
+        fallen.tick = 4;
+        fallen.players[0].hp = 0;
+        app.handle_server_packet(ServerPacket::Tick(fallen.clone()));
+        assert_eq!(app.sound_cue.take(), Some(Cue::Fallen));
+        assert_eq!(app.ambience_level(), 0.0);
+
+        fallen.tick = 5;
+        app.handle_server_packet(ServerPacket::Tick(fallen));
+        assert_eq!(app.sound_cue, None);
     }
 }

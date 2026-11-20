@@ -1,8 +1,8 @@
 use crate::app::{
-    AppState, InputMode, Screen, ServerBannerData, CLASS_PREVIEWS, DEATH_BANNER, DEATH_COLOR_ACCENT,
-    DEATH_COLOR_PRIMARY, TITLE_BANNER, TITLE_COLOR_ACCENT, TITLE_COLOR_MUTED, TITLE_COLOR_PRIMARY,
+    AppState, InputMode, Screen, ServerBannerData, CLASS_PREVIEWS, TITLE_COLOR_ACCENT,
+    TITLE_COLOR_MUTED,
 };
-use hyaku_protocol::{BossPhase, Direction, EnemyState, Position, Tile, PLAYER_CLASSES};
+use hyaku_protocol::{BossPhase, EnemyState, Position, Tile};
 use ratatui::{
     layout::{Alignment, Constraint, Direction as LayoutDirection, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -10,6 +10,16 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Gauge, Paragraph, Wrap},
     Frame,
 };
+
+const DUSK: Color = Color::Rgb(19, 19, 23);
+const BRASS: Color = Color::Rgb(222, 183, 119);
+const FRAME_STONE: Color = Color::Rgb(123, 112, 94);
+
+fn tower_panel() -> Block<'static> {
+    Block::bordered()
+        .border_style(Style::default().fg(FRAME_STONE))
+        .title_style(Style::default().fg(BRASS))
+}
 
 // TODO: Revise the stratum palettes and shrine art.
 #[allow(dead_code)]
@@ -33,7 +43,6 @@ pub struct StratumPalette {
     pub floor_primary: Color,
     pub floor_secondary: Color,
     pub floor_tertiary: Color,
-    pub border_color: Color,
     pub accent_color: Color,
     pub chasm_wind_color: Color,
     pub chasm_depth_bg: Color,
@@ -45,12 +54,11 @@ pub fn get_stratum_palette(floor: u8) -> StratumPalette {
             stratum_idx: 1,
             name: "Stratum I: Subterranean Vaults",
             desc: "Ancient mossy stone halls lit by dying embers",
-            wall_color: Color::Rgb(115, 130, 155),
-            floor_primary: Color::Rgb(85, 95, 115),
-            floor_secondary: Color::Rgb(70, 105, 90),
-            floor_tertiary: Color::Rgb(105, 115, 130),
-            border_color: Color::Rgb(120, 190, 255),
-            accent_color: Color::Rgb(120, 190, 255),
+            wall_color: Color::Rgb(135, 128, 115),
+            floor_primary: Color::Rgb(103, 97, 86),
+            floor_secondary: Color::Rgb(87, 104, 85),
+            floor_tertiary: Color::Rgb(127, 119, 103),
+            accent_color: BRASS,
             chasm_wind_color: Color::Rgb(65, 90, 120),
             chasm_depth_bg: Color::Rgb(8, 10, 16),
         },
@@ -62,7 +70,6 @@ pub fn get_stratum_palette(floor: u8) -> StratumPalette {
             floor_primary: Color::Rgb(95, 85, 120),
             floor_secondary: Color::Rgb(120, 95, 140),
             floor_tertiary: Color::Rgb(80, 75, 105),
-            border_color: Color::Rgb(175, 135, 255),
             accent_color: Color::Rgb(175, 135, 255),
             chasm_wind_color: Color::Rgb(120, 75, 175),
             chasm_depth_bg: Color::Rgb(12, 8, 18),
@@ -75,7 +82,6 @@ pub fn get_stratum_palette(floor: u8) -> StratumPalette {
             floor_primary: Color::Rgb(85, 95, 125),
             floor_secondary: Color::Rgb(75, 85, 115),
             floor_tertiary: Color::Rgb(105, 115, 140),
-            border_color: Color::Rgb(255, 130, 90),
             accent_color: Color::Rgb(255, 130, 90),
             chasm_wind_color: Color::Rgb(85, 125, 210),
             chasm_depth_bg: Color::Rgb(6, 8, 16),
@@ -88,7 +94,6 @@ pub fn get_stratum_palette(floor: u8) -> StratumPalette {
             floor_primary: Color::Rgb(120, 105, 80),
             floor_secondary: Color::Rgb(150, 120, 70),
             floor_tertiary: Color::Rgb(105, 90, 65),
-            border_color: Color::Rgb(255, 205, 80),
             accent_color: Color::Rgb(255, 205, 80),
             chasm_wind_color: Color::Rgb(180, 135, 55),
             chasm_depth_bg: Color::Rgb(14, 10, 6),
@@ -101,7 +106,6 @@ pub fn get_stratum_palette(floor: u8) -> StratumPalette {
             floor_primary: Color::Rgb(115, 75, 65),
             floor_secondary: Color::Rgb(145, 85, 60),
             floor_tertiary: Color::Rgb(100, 65, 55),
-            border_color: Color::Rgb(255, 145, 60),
             accent_color: Color::Rgb(255, 145, 60),
             chasm_wind_color: Color::Rgb(210, 105, 45),
             chasm_depth_bg: Color::Rgb(20, 8, 6),
@@ -114,7 +118,6 @@ pub fn get_stratum_palette(floor: u8) -> StratumPalette {
             floor_primary: Color::Rgb(65, 110, 80),
             floor_secondary: Color::Rgb(85, 135, 95),
             floor_tertiary: Color::Rgb(55, 95, 70),
-            border_color: Color::Rgb(100, 245, 140),
             accent_color: Color::Rgb(100, 245, 140),
             chasm_wind_color: Color::Rgb(80, 195, 120),
             chasm_depth_bg: Color::Rgb(6, 16, 10),
@@ -127,7 +130,6 @@ pub fn get_stratum_palette(floor: u8) -> StratumPalette {
             floor_primary: Color::Rgb(75, 135, 165),
             floor_secondary: Color::Rgb(115, 215, 235),
             floor_tertiary: Color::Rgb(95, 155, 185),
-            border_color: Color::Rgb(90, 245, 230),
             accent_color: Color::Rgb(90, 245, 230),
             chasm_wind_color: Color::Rgb(100, 220, 255),
             chasm_depth_bg: Color::Rgb(6, 12, 22),
@@ -140,7 +142,6 @@ pub fn get_stratum_palette(floor: u8) -> StratumPalette {
             floor_primary: Color::Rgb(110, 145, 185),
             floor_secondary: Color::Rgb(165, 210, 245),
             floor_tertiary: Color::Rgb(95, 130, 165),
-            border_color: Color::Rgb(180, 235, 255),
             accent_color: Color::Rgb(180, 235, 255),
             chasm_wind_color: Color::Rgb(140, 215, 255),
             chasm_depth_bg: Color::Rgb(10, 16, 26),
@@ -153,7 +154,6 @@ pub fn get_stratum_palette(floor: u8) -> StratumPalette {
             floor_primary: Color::Rgb(130, 80, 70),
             floor_secondary: Color::Rgb(170, 75, 55),
             floor_tertiary: Color::Rgb(110, 65, 60),
-            border_color: Color::Rgb(255, 100, 70),
             accent_color: Color::Rgb(255, 100, 70),
             chasm_wind_color: Color::Rgb(235, 105, 40),
             chasm_depth_bg: Color::Rgb(18, 6, 6),
@@ -166,7 +166,6 @@ pub fn get_stratum_palette(floor: u8) -> StratumPalette {
             floor_primary: Color::Rgb(175, 155, 95),
             floor_secondary: Color::Rgb(225, 205, 135),
             floor_tertiary: Color::Rgb(150, 135, 80),
-            border_color: Color::Rgb(255, 230, 100),
             accent_color: Color::Rgb(255, 230, 100),
             chasm_wind_color: Color::Rgb(255, 230, 120),
             chasm_depth_bg: Color::Rgb(16, 14, 8),
@@ -192,28 +191,54 @@ pub fn render(frame: &mut Frame, app: &mut AppState) {
 fn render_title_screen(frame: &mut Frame, app: &AppState) {
     let area = frame.area();
 
-    let chunks = Layout::default()
-        .direction(LayoutDirection::Vertical)
-        .constraints([
-            Constraint::Length(8), // Logo Banner
-            Constraint::Length(3), // Username
-            Constraint::Min(12),   // Class Selector & Preview
-            Constraint::Length(3), // Keybindings footer
-        ])
-        .margin(1)
-        .split(area);
+    let wide = area.width >= 72 && area.height >= 23;
+    let large_title = area.width >= 34 && area.height >= 16;
+    let title_height = if wide { 11 } else if large_title { 5 } else { 1 };
+    let menu = area.centered_horizontally(Constraint::Length(area.width.min(86)));
+    let chunks = Layout::vertical([
+        Constraint::Length(title_height),
+        Constraint::Length(2),
+        Constraint::Min(1),
+        Constraint::Length(2),
+    ])
+    .margin(1)
+    .split(menu);
 
-    // 1. Title Banner
-    let banner = Paragraph::new(TITLE_BANNER)
-        .alignment(Alignment::Center)
-        .style(
-            Style::default()
-                .fg(TITLE_COLOR_PRIMARY)
-                .add_modifier(Modifier::BOLD),
-        );
-    frame.render_widget(banner, chunks[0]);
+    let gold = Style::default()
+        .fg(BRASS)
+        .add_modifier(Modifier::BOLD);
+    let stone = Color::Rgb(148, 143, 129);
+    frame.render_widget(Block::default().style(Style::default().bg(DUSK)), area);
 
-    // 2. Username input
+    let wordmark = [
+        r"|   | \   /  /-\  |  / |   |",
+        r"|   |  \ /  /   \ | /  |   |",
+        r"|---|   |   |---| |<   |   |",
+        r"|   |   |   |   | | \  |   |",
+        r"|   |   |   |   | |  \  \_/ ",
+    ];
+    let title_area = if wide {
+        let hero = Layout::horizontal([Constraint::Percentage(49), Constraint::Percentage(51)])
+            .split(chunks[0]);
+        render_title_keep(frame, hero[1], stone);
+        hero[0].centered_vertically(Constraint::Length(7))
+    } else {
+        chunks[0]
+    };
+
+    let mut title = if large_title {
+        wordmark.into_iter().map(|row| Line::styled(row, gold)).collect::<Vec<_>>()
+    } else {
+        vec![Line::styled("HYAKU", gold)]
+    };
+    if wide {
+        title.extend([
+            Line::default(),
+            Line::styled("THE HUNDRED FLOORS", Style::default().fg(stone)),
+        ]);
+    }
+    frame.render_widget(Paragraph::new(title).centered(), title_area);
+
     let name_style = if app.title_edit_name {
         Style::default()
             .fg(Color::Black)
@@ -224,130 +249,96 @@ fn render_title_screen(frame: &mut Frame, app: &AppState) {
     };
 
     let cursor = if app.title_edit_name { "_" } else { "" };
-    let username_line = Line::from(vec![
-        Span::raw("  Adventurer Name: [ "),
-        Span::styled(format!("{}{}", app.username, cursor), name_style),
-        Span::raw(" ]  "),
-        Span::styled(
-            if app.title_edit_name {
-                "(Press Enter to confirm)"
-            } else {
-                "(Press TAB to edit)"
-            },
-            Style::default().fg(TITLE_COLOR_MUTED),
-        ),
+    let name = Line::from(vec![
+        Span::raw("Name  "),
+        Span::styled(format!("{}{cursor}", app.username), name_style),
     ]);
-    let username_p = Paragraph::new(username_line)
-        .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::NONE));
-    frame.render_widget(username_p, chunks[1]);
+    let name_hint = if app.title_edit_name { "" } else { "[Tab] Edit name" };
+    frame.render_widget(
+        Paragraph::new(vec![name, Line::styled(name_hint, Style::default().fg(Color::Gray))]).centered(),
+        chunks[1],
+    );
 
-    // 3. Class selector & preview
-    let class_chunks = Layout::default()
-        .direction(LayoutDirection::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(chunks[2]);
-
+    let preview = area.width >= 60 && chunks[2].height >= 7;
+    let class_chunks = Layout::horizontal([
+        Constraint::Percentage(if preview { 60 } else { 100 }),
+        Constraint::Min(0),
+    ])
+    .spacing(if preview { 2 } else { 0 })
+    .split(chunks[2]);
     let preset = app.current_class_preset();
     let class_info = vec![
-        Line::from(vec![
-            Span::raw("  <  "),
-            Span::styled(
-                format!("[ {} ]", preset.name),
-                Style::default()
-                    .fg(TITLE_COLOR_ACCENT)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  >  "),
-            Span::styled(
-                format!("({} of {})", app.class_idx + 1, PLAYER_CLASSES.len()),
-                Style::default().fg(TITLE_COLOR_MUTED),
-            ),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            format!("  {}", preset.description),
-            Style::default().fg(Color::Gray),
-        )),
-        Line::from(""),
-        Line::from(vec![
-            Span::raw("  Base HP:       "),
-            Span::styled(
-                format!("{}", preset.max_hp),
-                Style::default().fg(Color::Green),
-            ),
-        ]),
-        Line::from(vec![
-            Span::raw("  Base Mana:     "),
-            Span::styled(
-                format!("{}", preset.max_mana),
-                Style::default().fg(Color::Blue),
-            ),
-        ]),
-        Line::from(vec![
-            Span::raw("  Attack Power:  "),
-            Span::styled(
-                format!("{}", preset.attack_power),
-                Style::default().fg(Color::Red),
-            ),
-        ]),
-        Line::from(vec![
-            Span::raw("  Map Glyph:     "),
-            Span::styled(
-                format!("'{}'", preset.glyph),
-                Style::default().fg(Color::Rgb(
-                    preset.color_rgb.0,
-                    preset.color_rgb.1,
-                    preset.color_rgb.2,
-                )),
-            ),
-        ]),
+        Line::styled(format!("<  {}  >", preset.name), gold),
+        Line::raw(format!("HP {}   MP {}   ATK {}", preset.max_hp, preset.max_mana, preset.attack_power)),
+        Line::styled(preset.description, Style::default().fg(Color::Gray)),
     ];
+    let panel = tower_panel();
+    frame.render_widget(
+        Paragraph::new(class_info)
+            .centered()
+            .wrap(Wrap { trim: true })
+            .block(panel.clone().title(" Class ")),
+        class_chunks[0],
+    );
+    if preview {
+        let weapon: Vec<_> = CLASS_PREVIEWS[app.class_idx].iter().copied().map(Line::raw).collect();
+        frame.render_widget(
+            Paragraph::new(weapon)
+                .centered()
+                .style(gold)
+                .block(panel.title(" Weapon ")),
+            class_chunks[1],
+        );
+    }
 
-    let class_block = Block::default()
-        .title(" Select Class ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(TITLE_COLOR_PRIMARY));
-    let class_p = Paragraph::new(class_info).block(class_block);
-    frame.render_widget(class_p, class_chunks[0]);
-
-    // Preview ASCII box
-    let preview_art = if app.class_idx < CLASS_PREVIEWS.len() {
-        CLASS_PREVIEWS[app.class_idx]
+    let controls = if app.title_edit_name {
+        ["[Enter] Confirm  [Esc] Close", ""]
     } else {
-        ""
+        ["[Enter] Climb  [Q/Esc] Quit", "[A/D or arrows] Class"]
     };
+    frame.render_widget(Paragraph::new(controls.join("\n")).centered(), chunks[3]);
+}
 
-    let preview_block = Block::default()
-        .title(" Weapon / Emblem ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(TITLE_COLOR_ACCENT));
-    let preview_p = Paragraph::new(preview_art)
-        .alignment(Alignment::Center)
-        .block(preview_block);
-    frame.render_widget(preview_p, class_chunks[1]);
+fn render_title_keep(frame: &mut Frame, area: Rect, stone: Color) {
+    let keep = [
+        r"                 /\             .",
+        r"                /  \        .-' )",
+        r"          /\   /____\       '--'",
+        r"         /__\   |[]|        _",
+        r"     ____|  |___|  |____   / \ ",
+        r"    /    |[]|  .|  |    \_/___\ ",
+        r" __/..   |__|___|__|___ |  [] |_",
+        r"/_______/|  _   __    |\|_____|_\ ",
+        r"    \___/|_/ \_/  \___|  \___/",
+        r"          /____|_ _|____\ ",
+        r"       __/____/___\____\___",
+    ];
+    let area = area.centered_horizontally(Constraint::Length(36));
+    let scene: Vec<_> = keep.into_iter().map(Line::raw).collect();
+    frame.render_widget(Paragraph::new(scene).style(Style::default().fg(stone)), area);
 
-    // 4. Footer controls
-    let footer_line = Line::from(vec![
-        Span::styled(
-            " [Enter] ",
-            Style::default()
-                .fg(TITLE_COLOR_ACCENT)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("Ascend the Tower  | "),
-        Span::styled(
-            " [A/D / Left/Right] ",
-            Style::default().fg(TITLE_COLOR_PRIMARY),
-        ),
-        Span::raw("Switch Class  | "),
-        Span::styled(" [TAB] ", Style::default().fg(TITLE_COLOR_PRIMARY)),
-        Span::raw("Edit Name  | "),
-        Span::styled(" [Q / Esc] ", Style::default().fg(Color::Red)),
-        Span::raw("Quit"),
-    ]);
-    let footer_p = Paragraph::new(footer_line).alignment(Alignment::Center);
-    frame.render_widget(footer_p, chunks[3]);
+    let tick = frame.count();
+    let buf = frame.buffer_mut();
+
+    let drift = (tick / 15) % 20;
+    let cloud_x = area.x + 2 + drift.min(20 - drift) as u16;
+    buf.set_string(cloud_x, area.y, ".--.", Style::default().fg(Color::Rgb(84, 89, 106)));
+    let far_cloud_x = area.x + 1 + ((tick / 24 + 2) % 5) as u16;
+    buf.set_string(far_cloud_x, area.y + 2, ".-.", Style::default().fg(Color::Rgb(67, 71, 85)));
+
+    let pennant = ["|-~.", "|~~'", "|--~", "|~.."][(tick / 11) % 4];
+    buf.set_string(area.x + 11, area.y + 1, pennant, Style::default().fg(Color::Rgb(145, 96, 80)));
+
+    let (fire, glow) = [(".", 190), ("*", 255), ("+", 221), ("*", 240)][(tick / 7) % 4];
+    buf.set_string(area.x + 17, area.y + 9, fire, Style::default().fg(Color::Rgb(glow, 157, 86)));
+
+    let (x, y, glyph, light) = [
+        (17, 8, ".", 239),
+        (16, 8, "'", 212),
+        (18, 7, ".", 164),
+        (19, 7, ".", 120),
+    ][(tick / 8) % 4];
+    buf.set_string(area.x + x, area.y + y, glyph, Style::default().fg(Color::Rgb(light, 106, 61)));
 }
 
 fn render_connecting_screen(frame: &mut Frame, app: &AppState) {
@@ -376,10 +367,7 @@ fn render_connecting_screen(frame: &mut Frame, app: &AppState) {
     ];
 
     let p = Paragraph::new(text).alignment(Alignment::Center).block(
-        Block::default()
-            .title(" Connecting ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(TITLE_COLOR_PRIMARY)),
+        tower_panel().title(" Connecting "),
     );
     frame.render_widget(p, popup);
 }
@@ -424,6 +412,7 @@ fn render_disconnected_screen(frame: &mut Frame, app: &AppState) {
 
 fn render_game_screen(frame: &mut Frame, app: &mut AppState) {
     let area = frame.area();
+    frame.render_widget(Block::default().style(Style::default().bg(DUSK)), area);
     let boss = app.tick_state.as_ref().and_then(|tick| {
         tick.enemies.iter().find(|e| e.is_alive() && e.boss_phase.is_some())
     });
@@ -592,9 +581,7 @@ fn render_top_status_bar(frame: &mut Frame, app: &AppState, area: Rect) {
         })
     });
 
-    let top_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(palette.border_color));
+    let top_block = tower_panel();
     let inner = top_block.inner(area);
     frame.render_widget(top_block, area);
 
@@ -744,7 +731,7 @@ fn render_camera_viewport(frame: &mut Frame, app: &mut AppState, area: Rect) {
     let border_color = if let Some((flash_color, _)) = app.screen_flash {
         flash_color
     } else {
-        palette.border_color
+        FRAME_STONE
     };
 
     let title_badge = if let Some((flash_color, _)) = app.screen_flash {
@@ -759,12 +746,9 @@ fn render_camera_viewport(frame: &mut Frame, app: &mut AppState, area: Rect) {
         ""
     };
 
-    let map_block = Block::default()
-        .title(format!(
-            " Floor {}: {} {}(Main Camera Viewport 72%) ",
-            app.current_floor, palette.name, title_badge
-        ))
-        .borders(Borders::ALL)
+    let biome = palette.name.split_once(": ").map_or(palette.name, |(_, name)| name);
+    let map_block = tower_panel()
+        .title(format!(" F{} / {} {} ", app.current_floor, biome, title_badge))
         .border_style(Style::default().fg(border_color).add_modifier(
             if app.screen_flash.is_some() {
                 Modifier::BOLD
@@ -1262,36 +1246,30 @@ fn render_camera_viewport(frame: &mut Frame, app: &mut AppState, area: Rect) {
             }
         }
 
-        // 7. Render local player aiming reticle
-        if let Some(me) = app.my_player() {
-            let target_pos = me.pos.step(app.last_dir);
-            let (tx, ty) = app.world_to_screen(target_pos);
-            if tx >= 0 && tx < inner_w && ty >= 0 && ty < inner_h {
-                let (cur_ch, cur_style) = grid[ty as usize][tx as usize];
-                let has_enemy = tick.enemies.iter().any(|e| e.is_alive() && e.occupies(target_pos));
+        if let Some(me) = app.my_player().filter(|p| p.is_alive()) {
+            let mut has_target = false;
+            for tile in app.attack_tiles() {
+                if !tick.enemies.iter().any(|enemy| enemy.is_alive() && enemy.occupies(tile.pos)) {
+                    continue;
+                }
+                has_target = true;
+                let (x, y) = app.world_to_screen(tile.pos);
+                if (0..inner_w).contains(&x) && (0..inner_h).contains(&y) {
+                    let cell = &mut grid[y as usize][x as usize];
+                    cell.1 = cell.1.bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD);
+                }
+            }
 
-                if has_enemy {
-                    grid[ty as usize][tx as usize] = (
-                        cur_ch,
-                        cur_style
-                            .bg(Color::Red)
-                            .fg(Color::White)
-                            .add_modifier(Modifier::BOLD),
-                    );
-                } else if cur_ch != '#' {
-                    let arrow = match app.last_dir {
-                        Direction::Up => '▲',
-                        Direction::Down => '▼',
-                        Direction::Left => '◄',
-                        Direction::Right => '►',
-                    };
-                    grid[ty as usize][tx as usize] = (
-                        arrow,
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Rgb(255, 215, 0))
-                            .add_modifier(Modifier::BOLD),
-                    );
+            if !has_target {
+                let (x, y) = app.world_to_screen(me.pos.step(app.last_dir));
+                if (0..inner_w).contains(&x) && (0..inner_h).contains(&y) {
+                    let cell = &mut grid[y as usize][x as usize];
+                    if cell.0 != '#' {
+                        *cell = (
+                            app.last_dir.arrow_glyph(),
+                            Style::default().fg(Color::Black).bg(BRASS).add_modifier(Modifier::BOLD),
+                        );
+                    }
                 }
             }
         }
@@ -1453,7 +1431,7 @@ fn tile_to_glyph_and_style(
                 let beam = ((pos.x * 5).wrapping_add(pos.y * 7).wrapping_add(aura_step)).rem_euclid(7);
                 if beam == 0 {
                     (
-                        '▲',
+                        '·',
                         Style::default()
                             .fg(Color::Rgb(130, 255, 190))
                             .bg(Color::Rgb(18, 48, 32)),
@@ -1471,9 +1449,10 @@ fn tile_to_glyph_and_style(
                 let (ch, col) = match hash % 10 {
                     0 => (',', palette.floor_secondary),
                     1 => ('.', palette.floor_tertiary),
-                    _ => ('·', palette.floor_primary),
+                    2..=5 => ('·', palette.floor_primary),
+                    _ => (' ', palette.floor_primary),
                 };
-                (ch, Style::default().fg(col).bg(Color::Rgb(16, 20, 26)))
+                (ch, Style::default().fg(col).bg(DUSK))
             }
         }
         Tile::Chasm => {
@@ -1608,10 +1587,7 @@ fn render_sidebar(frame: &mut Frame, app: &AppState, area: Rect) {
 }
 
 fn render_radar_minimap(frame: &mut Frame, app: &AppState, area: Rect) {
-    let block = Block::default()
-        .title(" [ 1. Live Radar Minimap ] ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(TITLE_COLOR_PRIMARY));
+    let block = tower_panel().title(" Radar ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1764,10 +1740,7 @@ fn render_radar_minimap(frame: &mut Frame, app: &AppState, area: Rect) {
 }
 
 fn render_nearby_climbers(frame: &mut Frame, app: &AppState, area: Rect) {
-    let block = Block::default()
-        .title(" [ 2. Nearby Climbers ] ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(TITLE_COLOR_ACCENT));
+    let block = tower_panel().title(" Nearby Climbers ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1829,13 +1802,12 @@ fn render_nearby_climbers(frame: &mut Frame, app: &AppState, area: Rect) {
 }
 
 fn render_tower_comms(frame: &mut Frame, app: &AppState, area: Rect) {
-    let block = Block::default()
-        .title(" [ 3. Tower Comms ] ")
-        .borders(Borders::ALL)
+    let block = tower_panel()
+        .title(" Tower Comms ")
         .border_style(match app.input_mode {
             InputMode::Chatting => Style::default().fg(TITLE_COLOR_ACCENT),
             InputMode::CarvingMessage => Style::default().fg(Color::LightYellow),
-            InputMode::Normal => Style::default().fg(Color::DarkGray),
+            InputMode::Normal => Style::default().fg(FRAME_STONE),
         });
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -1918,10 +1890,7 @@ fn render_tower_comms(frame: &mut Frame, app: &AppState, area: Rect) {
 // 4. Bottom HUD: Local HP bar, Mana bar, Shards held, and keybind hints
 // -------------------------------------------------------------------------
 fn render_bottom_hud(frame: &mut Frame, app: &AppState, area: Rect) {
-    let block = Block::default()
-        .title(" [ Adventurer HUD & Tactical Controls ] ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(TITLE_COLOR_PRIMARY));
+    let block = tower_panel().title(" Climber ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1987,12 +1956,6 @@ fn render_bottom_hud(frame: &mut Frame, app: &AppState, area: Rect) {
 
     // Shards & Class details
     let class_name = app.current_class_preset().name;
-    let reach_desc = match app.class_idx {
-        1 => "Spell Reach 3",
-        2 => "Ranged Reach 4",
-        _ => "Melee Reach 1",
-    };
-
     let shards_line = Line::from(vec![
         Span::raw("  Shards: "),
         Span::styled(
@@ -2009,7 +1972,7 @@ fn render_bottom_hud(frame: &mut Frame, app: &AppState, area: Rect) {
             format!("{} {}", app.last_dir.arrow_glyph(), class_name),
             Style::default().fg(TITLE_COLOR_ACCENT).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(format!(" - {}", reach_desc), Style::default().fg(Color::Gray)),
+        Span::styled(" - Slash 2 tiles", Style::default().fg(Color::Gray)),
         Span::raw("]"),
     ]);
     frame.render_widget(Paragraph::new(shards_line), cols[2]);
@@ -2069,39 +2032,53 @@ fn format_mini_bar(cur: i32, max: i32, width: usize) -> (String, Color) {
 }
 
 fn render_death_screen(frame: &mut Frame, area: Rect) {
-    let popup = centered_rect(65, 45, area);
+    let art = area.width >= 38 && area.height >= 16;
+    let popup = area.centered(
+        Constraint::Length(area.width.min(54)),
+        Constraint::Length(if art { 15 } else { 5 }),
+    );
     frame.render_widget(Clear, popup);
 
-    let text = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            DEATH_BANNER,
-            Style::default()
-                .fg(DEATH_COLOR_PRIMARY)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("  [R] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled(
-                "Respawn at Campfire / Spawn Point",
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("  [Esc / Q] ", Style::default().fg(DEATH_COLOR_ACCENT)),
-            Span::styled("Quit to Terminal", Style::default().fg(DEATH_COLOR_ACCENT)),
-        ]),
-    ];
+    let ash = Color::Rgb(175, 158, 146);
+    let ember = Color::Rgb(232, 116, 92);
+    let mut lines = vec![Line::styled(
+        "F A L L E N",
+        Style::default().fg(ember).add_modifier(Modifier::BOLD),
+    )];
+    if art {
+        let (spark_top, spark_low) = [(" ", "."), ("'", " "), ("*", " "), (" ", ".")]
+            [(frame.count() / 12) % 4];
+        let spark = Style::default().fg(ember);
+        lines.extend([
+            Line::default(),
+            Line::raw(r"           /\              "),
+            Line::raw(r"          /  \             "),
+            Line::raw(r"          |  /             "),
+            Line::from(vec![
+                Span::raw("          |/'      "),
+                Span::styled(spark_top, spark),
+                Span::raw("       "),
+            ]),
+            Line::from(vec![
+                Span::raw("              /|   "),
+                Span::styled(spark_low, spark),
+                Span::raw("       "),
+            ]),
+            Line::raw(r"        _____/ |_____      "),
+            Line::raw(r"        '--.__   __.--'    "),
+            Line::raw(r"             \_/           "),
+            Line::default(),
+        ]);
+    }
+    lines.extend([
+        Line::styled("[R] Respawn", Style::default().fg(Color::White)),
+        Line::styled("[Q/Esc] Quit", Style::default().fg(ash)),
+    ]);
 
-    let p = Paragraph::new(text).alignment(Alignment::Center).block(
-        Block::default()
-            .title(" Slain in the Tower ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(DEATH_COLOR_PRIMARY)),
-    );
-    frame.render_widget(p, popup);
+    let block = Block::bordered()
+        .border_style(Style::default().fg(Color::Rgb(142, 81, 75)))
+        .style(Style::default().fg(ash).bg(Color::Rgb(29, 19, 21)));
+    frame.render_widget(Paragraph::new(lines).centered().block(block), popup);
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
@@ -2178,6 +2155,55 @@ mod tests {
     use ratatui::{backend::TestBackend, Terminal};
 
     #[test]
+    fn title_and_death_art_animate_without_clipping_controls() {
+        let app = AppState::new("Alice".into(), "ws://localhost".into(), 0);
+        for (width, height) in [(80, 24), (30, 12)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let render_title = |frame: &mut Frame| render_title_screen(frame, &app);
+            terminal.draw(render_title).unwrap();
+            let read = |terminal: &Terminal<TestBackend>| -> String {
+                terminal.backend().buffer().content().iter().map(|cell| cell.symbol()).collect()
+            };
+            let title = read(&terminal);
+            assert_eq!(terminal.backend().buffer()[(0, 0)].bg, DUSK);
+            assert!(title.contains("[Enter] Climb") && title.contains("[Q/Esc] Quit"));
+            assert!(title.contains("Blade") && title.contains("Alice"));
+            if width == 80 {
+                assert!(title.contains(r"__________/\"));
+                for _ in 0..16 {
+                    terminal.draw(render_title).unwrap();
+                }
+                assert!(read(&terminal).contains("/____|_+_|____"));
+                for _ in 0..16 {
+                    terminal.draw(render_title).unwrap();
+                }
+                let animated = read(&terminal);
+                let sky = width as usize..2 * width as usize;
+                assert_ne!(&animated[sky.clone()], &title[sky]);
+                for (idx, (before, after)) in title.bytes().zip(animated.bytes()).enumerate() {
+                    if before != after {
+                        assert!(idx / (width as usize) < 12 && idx % width as usize >= 39);
+                    }
+                }
+            } else {
+                assert!(title.contains("HYAKU"));
+            }
+
+            let render_death = |frame: &mut Frame| render_death_screen(frame, frame.area());
+            terminal.draw(render_death).unwrap();
+            let death = read(&terminal);
+            assert!(death.contains("F A L L E N") && death.contains("[R] Respawn"));
+            assert!(death.contains("[Q/Esc] Quit"));
+            if width == 80 {
+                for _ in 0..12 {
+                    terminal.draw(render_death).unwrap();
+                }
+                assert_ne!(read(&terminal), death);
+            }
+        }
+    }
+
+    #[test]
     fn raid_screen_draws_the_shield_cue_sprite_and_warning() {
         let map = FloorMap::generate(42, 10);
         let mut boss = map.initial_enemies.iter().find(|e| e.kind == EnemyKind::FloorBoss)
@@ -2207,6 +2233,8 @@ mod tests {
         for (width, height) in [(80, 24), (48, 14)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal.draw(|frame| render_game_screen(frame, &mut app)).unwrap();
+            let corner = &terminal.backend().buffer()[(0, 0)];
+            assert_eq!((corner.fg, corner.bg), (FRAME_STONE, DUSK));
             let screen: String = terminal.backend().buffer().content().iter().map(|cell| cell.symbol()).collect();
             assert!(screen.contains("SHIELD [Q] TETHER ACROSS"), "{screen}");
             if height == 24 {

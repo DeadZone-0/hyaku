@@ -4,6 +4,7 @@ pub mod map;
 pub mod map_gen;
 pub mod packet;
 pub mod position;
+mod slash;
 pub mod tile;
 
 pub use direction::Direction;
@@ -19,6 +20,7 @@ pub use map_gen::{
 };
 pub use packet::{ClientPacket, ServerPacket, TickState};
 pub use position::Position;
+pub use slash::{slash_tiles, SlashTile};
 pub use tile::Tile;
 
 #[cfg(test)]

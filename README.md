@@ -41,6 +41,12 @@ hyaku-update
 
 ---
 
+## Audio
+
+Hyaku includes a dungeon loop that fades between screens, menu clicks, sword swings and hits, chimes for shrine completion and floor ascent, and gong cues for the Gatekeeper and death. Run `hyaku --mute` to turn it all off. On macOS, ambience uses Core Audio and sound effects use `afplay`. On Linux, playback uses `pw-play`, `paplay`, `ffplay`, or `aplay` when available.
+
+The bundled clips are CC0. The ambience is [Whispers in the Fog by Ruhinre](https://opengameart.org/content/whispers-in-the-fog). The sword clips come from [StarNinjas](https://opengameart.org/node/122900), and the menu clicks, chimes, gongs, and hurt sound come from [rubberduck](https://opengameart.org/content/100-cc0-sfx).
+
 ## Live Multiplayer Server
 
 An authoritative 24/7 game server is hosted on Hack Club Nest:
@@ -55,7 +61,7 @@ An authoritative 24/7 game server is hosted on Hack Club Nest:
 | Key | Action | Description |
 | :--- | :--- | :--- |
 | `[W] [A] [S] [D]` / Arrows | **Move** | Move your climber across the grid |
-| `[Space]` | **Directional Slash** | Melee sweep in your facing direction |
+| `[Space]` | **Directional Slash** | Sweep up to two tiles forward. If the swing would miss, it turns toward an adjacent enemy. |
 | `[Q]` | **Lightning Tether** | Link with the nearest ally or holo-decoy to shock enemies along the beam |
 | `[R]` | **Holo-Decoy** | Spend 20 Mana to spawn a 15-second hologram that holds down pressure plates |
 | `[B]` + Direction | **Build Bridge** | Spend 5 Shards to permanently bridge an adjacent Chasm (`═`) for all players |

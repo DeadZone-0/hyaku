@@ -644,8 +644,7 @@ impl ServerState {
                                 &player_name,
                                 dir,
                                 class_idx,
-                                floor.map.width,
-                                floor.map.height,
+                                |pos| FloorInstance::resolve_tile(&floor.map, &floor.tiles_override, pos),
                                 &mut floor.enemies,
                                 floor.tick_counter,
                             );
@@ -1477,7 +1476,8 @@ mod tests {
 
         floor.enemies[0].hp = 1;
         let slash = crate::combat::execute_directional_slash(
-            west, "Alice", Direction::Right, 0, floor.map.width, floor.map.height,
+            west, "Alice", Direction::Right, 0,
+            |pos| FloorInstance::resolve_tile(&floor.map, &floor.tiles_override, pos),
             &mut floor.enemies, floor.tick_counter,
         );
         assert_eq!(slash.hit_count, 1);

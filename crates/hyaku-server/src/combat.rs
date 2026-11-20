@@ -1,5 +1,5 @@
 use hyaku_protocol::{
-    BossPhase, Direction, EnemyKind, EnemyState, FloorMap, PlayerState, Position, ProjectileState, Tile,
+    slash_tiles, BossPhase, Direction, EnemyKind, EnemyState, FloorMap, PlayerState, Position, ProjectileState, Tile,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -10,79 +10,6 @@ pub const TETHER_MAX_RANGE: u32 = 8;
 
 /// Continuous electric damage dealt each tick to any enemy intersecting the tether beam
 pub const TETHER_DAMAGE_PER_TICK: i32 = 6;
-
-/// A single tile in the 3-tile directional melee sweep arc
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SlashTile {
-    pub pos: Position,
-    pub glyph: char,
-}
-
-/// Computes the 3-tile directional melee sweep arc based on player facing direction:
-/// - Up:    (x-1, y-1) '╱', (x, y-1) '─', (x+1, y-1) '╲'
-/// - Down:  (x-1, y+1) '╲', (x, y+1) '─', (x+1, y+1) '╱'
-/// - Left:  (x-1, y-1) '╲', (x-1, y) '│', (x-1, y+1) '╱'
-/// - Right: (x+1, y-1) '╱', (x+1, y) '│', (x+1, y+1) '╲'
-pub fn compute_directional_slash_arc(origin: Position, dir: Direction) -> [SlashTile; 3] {
-    match dir {
-        Direction::Up => [
-            SlashTile {
-                pos: Position::new(origin.x - 1, origin.y - 1),
-                glyph: '╱',
-            },
-            SlashTile {
-                pos: Position::new(origin.x, origin.y - 1),
-                glyph: '─',
-            },
-            SlashTile {
-                pos: Position::new(origin.x + 1, origin.y - 1),
-                glyph: '╲',
-            },
-        ],
-        Direction::Down => [
-            SlashTile {
-                pos: Position::new(origin.x - 1, origin.y + 1),
-                glyph: '╲',
-            },
-            SlashTile {
-                pos: Position::new(origin.x, origin.y + 1),
-                glyph: '─',
-            },
-            SlashTile {
-                pos: Position::new(origin.x + 1, origin.y + 1),
-                glyph: '╱',
-            },
-        ],
-        Direction::Left => [
-            SlashTile {
-                pos: Position::new(origin.x - 1, origin.y - 1),
-                glyph: '╲',
-            },
-            SlashTile {
-                pos: Position::new(origin.x - 1, origin.y),
-                glyph: '│',
-            },
-            SlashTile {
-                pos: Position::new(origin.x - 1, origin.y + 1),
-                glyph: '╱',
-            },
-        ],
-        Direction::Right => [
-            SlashTile {
-                pos: Position::new(origin.x + 1, origin.y - 1),
-                glyph: '╱',
-            },
-            SlashTile {
-                pos: Position::new(origin.x + 1, origin.y),
-                glyph: '│',
-            },
-            SlashTile {
-                pos: Position::new(origin.x + 1, origin.y + 1),
-                glyph: '╲',
-            },
-        ],
-    }
-}
 
 /// Bresenham's integer line algorithm connecting two positions
 pub fn bresenham_line(start: Position, end: Position) -> Vec<Position> {
@@ -120,20 +47,18 @@ pub struct SlashResult {
     pub slash_projectiles: Vec<(ProjectileState, u8)>,
 }
 
-/// Executes a directional melee sweep (`Space` key) across the 3 arc tiles
 pub fn execute_directional_slash(
     player_pos: Position,
     player_name: &str,
     dir: Direction,
     class_idx: usize,
-    map_width: i32,
-    map_height: i32,
-    enemies: &mut Vec<EnemyState>,
+    tile_at: impl Fn(Position) -> Option<Tile>,
+    enemies: &mut [EnemyState],
     tick_counter: u64,
 ) -> SlashResult {
     let class_preset = hyaku_protocol::get_class_preset(class_idx);
     let base_dmg = class_preset.attack_power;
-    let arc_tiles = compute_directional_slash_arc(player_pos, dir);
+    let arc_tiles = slash_tiles(player_pos, dir, enemies, tile_at);
 
     let mut hit_count = 0;
     let mut total_damage = 0;
@@ -141,21 +66,12 @@ pub fn execute_directional_slash(
     let mut announcements = Vec::new();
     let mut slash_projectiles = Vec::new();
 
-    // 1. Spawn directional slash arc projectiles (lasts 3 ticks on clients)
-    for tile in &arc_tiles {
-        if tile.pos.in_bounds(map_width, map_height) {
-            slash_projectiles.push((
-                ProjectileState::new(tile.pos, tile.glyph, class_preset.color_rgb),
-                3,
-            ));
-        }
-    }
-
     let mut hit_gatekeeper = false;
-    for tile in &arc_tiles {
-        if !tile.pos.in_bounds(map_width, map_height) {
-            continue;
-        }
+    for tile in arc_tiles {
+        slash_projectiles.push((
+            ProjectileState::new(tile.pos, tile.glyph, class_preset.color_rgb),
+            3,
+        ));
 
         for enemy in enemies.iter_mut() {
             if enemy.is_alive() && enemy.occupies(tile.pos) {
@@ -569,47 +485,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_compute_directional_slash_arc_glyphs_and_positions() {
-        let origin = Position::new(10, 10);
-
-        // Up: (9, 9) '╱', (10, 9) '─', (11, 9) '╲'
-        let up_arc = compute_directional_slash_arc(origin, Direction::Up);
-        assert_eq!(up_arc[0].pos, Position::new(9, 9));
-        assert_eq!(up_arc[0].glyph, '╱');
-        assert_eq!(up_arc[1].pos, Position::new(10, 9));
-        assert_eq!(up_arc[1].glyph, '─');
-        assert_eq!(up_arc[2].pos, Position::new(11, 9));
-        assert_eq!(up_arc[2].glyph, '╲');
-
-        // Down: (9, 11) '╲', (10, 11) '─', (11, 11) '╱'
-        let down_arc = compute_directional_slash_arc(origin, Direction::Down);
-        assert_eq!(down_arc[0].pos, Position::new(9, 11));
-        assert_eq!(down_arc[0].glyph, '╲');
-        assert_eq!(down_arc[1].pos, Position::new(10, 11));
-        assert_eq!(down_arc[1].glyph, '─');
-        assert_eq!(down_arc[2].pos, Position::new(11, 11));
-        assert_eq!(down_arc[2].glyph, '╱');
-
-        // Left: (9, 9) '╲', (9, 10) '│', (9, 11) '╱'
-        let left_arc = compute_directional_slash_arc(origin, Direction::Left);
-        assert_eq!(left_arc[0].pos, Position::new(9, 9));
-        assert_eq!(left_arc[0].glyph, '╲');
-        assert_eq!(left_arc[1].pos, Position::new(9, 10));
-        assert_eq!(left_arc[1].glyph, '│');
-        assert_eq!(left_arc[2].pos, Position::new(9, 11));
-        assert_eq!(left_arc[2].glyph, '╱');
-
-        // Right: (11, 9) '╱', (11, 10) '│', (11, 11) '╲'
-        let right_arc = compute_directional_slash_arc(origin, Direction::Right);
-        assert_eq!(right_arc[0].pos, Position::new(11, 9));
-        assert_eq!(right_arc[0].glyph, '╱');
-        assert_eq!(right_arc[1].pos, Position::new(11, 10));
-        assert_eq!(right_arc[1].glyph, '│');
-        assert_eq!(right_arc[2].pos, Position::new(11, 11));
-        assert_eq!(right_arc[2].glyph, '╲');
-    }
-
-    #[test]
     fn test_bresenham_line_algorithm() {
         let p0 = Position::new(2, 2);
         let p1 = Position::new(6, 2);
@@ -640,8 +515,7 @@ mod tests {
             "ZeHero",
             Direction::Up,
             0, // Striker
-            50,
-            50,
+            |_| Some(Tile::Floor),
             &mut enemies,
             100,
         );
@@ -654,6 +528,30 @@ mod tests {
         assert!(res.slash_projectiles.iter().any(|(p, _)| p.glyph == '╲'));
         assert!(res.slash_projectiles.iter().any(|(p, _)| p.glyph == '─'));
         assert!(res.slash_projectiles.iter().any(|(p, _)| p.glyph == '╱'));
+    }
+
+    #[test]
+    fn slash_hits_at_reach_and_turns_only_when_it_would_miss() {
+        let origin = Position::new(10, 10);
+        let mut enemies = [
+            EnemyState::new(1, EnemyKind::Brute, Position::new(10, 8), 1.0),
+            EnemyState::new(2, EnemyKind::Brute, Position::new(10, 11), 1.0),
+            EnemyState::new(3, EnemyKind::Brute, origin, 1.0),
+        ];
+        let tile_at = |_| Some(Tile::Floor);
+        let slash = execute_directional_slash(
+            origin, "Alice", Direction::Up, 0, tile_at, &mut enemies, 100,
+        );
+        assert_eq!(slash.hit_count, 2);
+        assert_eq!(enemies[1].hp, enemies[1].max_hp);
+
+        enemies[0].hp = 0;
+        enemies[2].hp = 0;
+        let slash = execute_directional_slash(
+            origin, "Alice", Direction::Up, 0, tile_at, &mut enemies, 101,
+        );
+        assert_eq!(slash.hit_count, 1);
+        assert!(enemies[1].hp < enemies[1].max_hp);
     }
 
     #[test]
