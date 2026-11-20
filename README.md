@@ -8,7 +8,7 @@ The Linux and macOS installer puts `hyaku`, its local server companion, and `hya
 
 ~~~sh
 curl -fsSL https://raw.githubusercontent.com/DeadZone-0/hyaku/main/install.sh | bash
-hyaku -u Aria -c 0
+hyaku
 ~~~
 
 The client defaults to the Hack Club Nest server at `ws://[2a01:4f9:3080:3192::2124]:3000/ws`. Use `hyaku-update` when a new release comes out. Pass `--server URL` to pick a server, `--connect` to skip the title screen, or `--mute` to turn off audio. The rest of this guide describes the code in this checkout.
