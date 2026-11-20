@@ -3,7 +3,23 @@ use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
 use std::io::{self, Write};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+pub fn can_resume(server: &str) -> bool {
+    let Ok(request) = server.into_client_request() else { return false };
+    let uri = request.uri();
+    match uri.scheme_str() {
+        Some("wss") => true,
+        Some("ws") => uri.host().is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host.trim_matches(['[', ']']).parse::<IpAddr>()
+                    .is_ok_and(|ip| ip.to_canonical().is_loopback())
+        }),
+        _ => false,
+    }
+}
 
 pub fn for_server(server: &str) -> io::Result<ResumeKey> {
     let base = env::var_os("XDG_DATA_HOME")
@@ -61,6 +77,15 @@ fn read_or_create(path: &Path) -> io::Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resume_keys_require_tls_or_loopback() {
+        assert!(can_resume("wss://tower.example/ws"));
+        assert!(can_resume("ws://[::1]:3000/ws"));
+        assert!(can_resume("ws://127.0.0.1:3000/ws"));
+        assert!(!can_resume("ws://tower.example/ws"));
+        assert!(!can_resume("ws://[2001:db8::1]:3000/ws"));
+    }
 
     #[test]
     fn key_is_reused_on_restart_and_scoped_to_one_server() {

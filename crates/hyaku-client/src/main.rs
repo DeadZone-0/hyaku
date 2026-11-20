@@ -130,7 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let sound = if muted { None } else { sound::Sound::open() };
 
-    let resume_key = if launch_local {
+    let resume_key = if launch_local || !resume::can_resume(&server_url) {
         None
     } else {
         match resume::for_server(&server_url) {

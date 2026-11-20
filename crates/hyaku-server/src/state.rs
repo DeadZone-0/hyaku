@@ -9,7 +9,8 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::{mpsc, Notify};
+use std::sync::Arc;
 
 /// Sanitizes user-supplied text to prevent ANSI escape sequence injection, terminal hijacking, and buffer bloat.
 pub fn sanitize_text(input: &str, max_chars: usize) -> String {
@@ -574,8 +575,21 @@ impl FloorInstance {
     }
 }
 
+struct ClientOutbox {
+    sender: mpsc::Sender<ServerPacket>,
+    overloaded: Arc<Notify>,
+}
+
+impl ClientOutbox {
+    fn send(&self, packet: ServerPacket) {
+        if matches!(self.sender.try_send(packet), Err(mpsc::error::TrySendError::Full(_))) {
+            self.overloaded.notify_one();
+        }
+    }
+}
+
 pub struct ServerState {
-    pub clients: HashMap<String, UnboundedSender<ServerPacket>>,
+    clients: HashMap<String, ClientOutbox>,
     pub client_floors: HashMap<String, u32>,
     pub floors: HashMap<u32, FloorInstance>,
     pub world_seed: u64,
@@ -703,7 +717,7 @@ impl ServerState {
 
     fn tell(&self, player_id: &str, text: impl Into<String>) {
         if let Some(tx) = self.clients.get(player_id) {
-            let _ = tx.send(ServerPacket::Announcement { text: text.into() });
+            tx.send(ServerPacket::Announcement { text: text.into() });
         }
     }
 
@@ -712,8 +726,10 @@ impl ServerState {
         self.tell(player_id, "The tower could not save that change. Try again.");
     }
 
-    pub fn register_client(&mut self, player_id: String, sender: UnboundedSender<ServerPacket>) {
-        self.clients.insert(player_id, sender);
+    pub fn register_client(&mut self, player_id: String, sender: mpsc::Sender<ServerPacket>) -> Arc<Notify> {
+        let overloaded = Arc::new(Notify::new());
+        self.clients.insert(player_id, ClientOutbox { sender, overloaded: overloaded.clone() });
+        overloaded
     }
 
     pub fn unregister_client(&mut self, player_id: &str) {
@@ -740,7 +756,7 @@ impl ServerState {
         for (client_id, client_floor) in &self.client_floors {
             if *client_floor == floor {
                 if let Some(tx) = self.clients.get(client_id) {
-                    let _ = tx.send(packet.clone());
+                    tx.send(packet.clone());
                 }
             }
         }
@@ -749,7 +765,7 @@ impl ServerState {
     #[allow(dead_code)]
     pub fn broadcast_to_all(&self, packet: ServerPacket) {
         for tx in self.clients.values() {
-            let _ = tx.send(packet.clone());
+            tx.send(packet.clone());
         }
     }
 
@@ -884,7 +900,7 @@ impl ServerState {
                     floor.players.values().any(|player| player.username.to_lowercase() == name)
                 }) {
                     if let Some(tx) = self.clients.get(player_id) {
-                        let _ = tx.send(ServerPacket::Error {
+                        tx.send(ServerPacket::Error {
                             message: "A climber with that name is already in the tower.".into(),
                         });
                     }
@@ -927,13 +943,13 @@ impl ServerState {
                 }
 
                 if let Some(tx) = self.clients.get(player_id) {
-                    let _ = tx.send(ServerPacket::Welcome {
+                    tx.send(ServerPacket::Welcome {
                         player_id: player_id.to_string(),
                         floor: start_floor,
                         map_seed: world_seed,
                         skip_prologue: saved.is_some() || demo_spawns.is_some(),
                     });
-                    let _ = tx.send(self.hall_of_fame_packet());
+                    tx.send(self.hall_of_fame_packet());
                 }
 
                 let join_announcement = format!("{} entered floor {}!", username, start_floor);
@@ -1344,7 +1360,7 @@ impl ServerState {
 
                     if let Some(msg) = direct_msg {
                         if let Some(tx) = self.clients.get(player_id) {
-                            let _ = tx.send(ServerPacket::Announcement { text: msg });
+                            tx.send(ServerPacket::Announcement { text: msg });
                         }
                     }
 
@@ -1467,7 +1483,7 @@ impl ServerState {
 
                     if let Some(msg) = direct_msg {
                         if let Some(tx) = self.clients.get(player_id) {
-                            let _ = tx.send(ServerPacket::Announcement { text: msg });
+                            tx.send(ServerPacket::Announcement { text: msg });
                         }
                     }
 
@@ -1544,7 +1560,7 @@ impl ServerState {
 
                     if let Some(msg) = direct_msg {
                         if let Some(tx) = self.clients.get(player_id) {
-                            let _ = tx.send(ServerPacket::Announcement { text: msg });
+                            tx.send(ServerPacket::Announcement { text: msg });
                         }
                     }
 
@@ -1614,7 +1630,7 @@ impl ServerState {
                             }
                             if current_floor == 100 {
                                 if let Some(tx) = self.clients.get(player_id) {
-                                    let _ = tx.send(ServerPacket::Victory);
+                                    tx.send(ServerPacket::Victory);
                                 }
                                 return;
                             }
@@ -1624,7 +1640,7 @@ impl ServerState {
 
                     if let Some(msg) = rejection_msg {
                         if let Some(tx) = self.clients.get(player_id) {
-                            let _ = tx.send(ServerPacket::Announcement {
+                            tx.send(ServerPacket::Announcement {
                                 text: msg.to_string(),
                             });
                         }
@@ -1642,7 +1658,7 @@ impl ServerState {
 
                             let transition_msg = format!("Ascended to Floor {}", next_floor);
                             if let Some(tx) = self.clients.get(player_id) {
-                                let _ = tx.send(ServerPacket::FloorTransition {
+                                tx.send(ServerPacket::FloorTransition {
                                     floor: next_floor,
                                     map_seed: seed,
                                     message: transition_msg,
@@ -1675,7 +1691,7 @@ impl ServerState {
 
                         if !username.is_empty() {
                             if let Some(tx) = self.clients.get(player_id) {
-                                let _ = tx.send(ServerPacket::Respawned);
+                                tx.send(ServerPacket::Respawned);
                             }
                             println!(
                                 "[HYAKU RESPAWN] Player '{}' respawned at ({}, {})",
@@ -1727,7 +1743,7 @@ impl ServerState {
 
             ClientPacket::Ping { seq } => {
                 if let Some(tx) = self.clients.get(player_id) {
-                    let _ = tx.send(ServerPacket::Pong { seq });
+                    tx.send(ServerPacket::Pong { seq });
                 }
             }
         }
@@ -1739,6 +1755,20 @@ mod tests {
     use super::*;
     use hyaku_protocol::Direction;
     use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn full_outbox_signals_disconnect_without_growing() {
+        let mut server = ServerState::new(123);
+        let (tx, mut rx) = mpsc::channel(1);
+        let overloaded = server.register_client("slow".into(), tx);
+
+        server.handle_packet("slow", ClientPacket::Ping { seq: 1 });
+        server.handle_packet("slow", ClientPacket::Ping { seq: 2 });
+
+        tokio::time::timeout(Duration::from_secs(1), overloaded.notified()).await.unwrap();
+        assert_eq!(rx.try_recv().unwrap(), ServerPacket::Pong { seq: 1 });
+        assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    }
 
     #[test]
     fn structures_carvings_and_first_ascent_survive_restart() {
@@ -1919,7 +1949,7 @@ mod tests {
     #[test]
     fn summit_requires_a_win_and_respawn_is_confirmed_by_the_server() {
         let mut server = ServerState::new(42);
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(256);
         server.register_client("alice".into(), tx);
         let floor = server.get_or_create_floor(100);
         let stairs = floor.map.stairs_pos;
@@ -2078,7 +2108,7 @@ mod tests {
     #[test]
     fn test_server_state_client_lifecycle() {
         let mut server = ServerState::new(999);
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(256);
         let client_id = "test-client-1".to_string();
 
         server.register_client(client_id.clone(), tx);
@@ -2129,7 +2159,7 @@ mod tests {
     #[test]
     fn test_ascension_gate_seals_stairs_until_opened() {
         let mut server = ServerState::new(42);
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(256);
         let client_id = "test-climber".to_string();
 
         server.register_client(client_id.clone(), tx);
@@ -2218,7 +2248,7 @@ mod tests {
     #[test]
     fn test_holo_decoy_mana_and_tick_expiration() {
         let mut server = ServerState::new(42);
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(256);
         let client_id = "decoy-wizard".to_string();
 
         server.register_client(client_id.clone(), tx);
@@ -2259,7 +2289,7 @@ mod tests {
     #[test]
     fn test_bridge_building_spends_5_shards() {
         let mut server = ServerState::new(42);
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(256);
         let client_id = "bridge-builder".to_string();
 
         server.register_client(client_id.clone(), tx);
@@ -2329,7 +2359,7 @@ mod tests {
     #[test]
     fn test_shrine_unlock_and_server_banner() {
         let mut server = ServerState::new(42);
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(256);
         let client_id = "shrine-hero".to_string();
 
         server.register_client(client_id.clone(), tx);
@@ -2456,8 +2486,8 @@ mod tests {
     #[test]
     fn test_coop_ally_revival() {
         let mut server = ServerState::new(123);
-        let (tx1, _rx1) = mpsc::unbounded_channel();
-        let (tx2, _rx2) = mpsc::unbounded_channel();
+        let (tx1, _rx1) = mpsc::channel(256);
+        let (tx2, _rx2) = mpsc::channel(256);
 
         server.register_client("hero-1".to_string(), tx1);
         server.register_client("hero-2".to_string(), tx2);

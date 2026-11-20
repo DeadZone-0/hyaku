@@ -96,6 +96,10 @@ sequenceDiagram
 
 The dedicated server keeps `hyaku_save.json` in its working directory. It stores floor progress, Hall of Fame entries, structures, carvings and their votes, and keyed resume locations. Set `HYAKU_SAVE_PATH` to change the save location or `HYAKU_BIND_ADDR` to change where the server listens.
 
+Resume works on loopback and on encrypted `wss://` connections. The current public Nest address uses plain `ws://`, so updated clients join there as guests. Resume keys are scoped to the server URL, so switching to a new address starts a new resume profile.
+
+For public hosting, terminate TLS at a reverse proxy and point clients at `wss://YOUR_HOST/ws`. Set `HYAKU_TRUSTED_PROXY` to the proxy's IP as seen by Hyaku, and restrict backend access to that proxy. If both run on the same machine, use `HYAKU_BIND_ADDR=127.0.0.1:3000` and `HYAKU_TRUSTED_PROXY=127.0.0.1`. The proxy must set `X-Forwarded-Proto: https` and put the real client IP last in `X-Forwarded-For`. Hyaku only reads those headers from the configured proxy.
+
 Run `cargo test --workspace` to check the shared rules, client rendering, combat, and save restoration.
 
 ## Audio credits
