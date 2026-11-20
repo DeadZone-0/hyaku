@@ -249,7 +249,10 @@ impl AppState {
                         true
                     };
 
-                    if can_walk {
+                    let boss_blocks = tick.enemies.iter().any(|e| {
+                        e.boss_phase.is_some() && e.is_alive() && e.occupies(next_pos)
+                    });
+                    if can_walk && !boss_blocks {
                         player.pos = next_pos;
                         self.predicted_pos = Some(next_pos);
                         self.predicted_time = Some(std::time::Instant::now());
@@ -750,6 +753,11 @@ impl AppState {
                     false
                 };
 
+                let raid_floor = self.current_floor % 10 == 0;
+                if is_near_shrine && raid_floor {
+                    self.announcement = Some("This shrine heals. It takes no shard offerings.".to_string());
+                    return;
+                }
                 if is_near_shrine {
                     if let Some((pos, shards)) = player_info {
                         if shards > 0 {
@@ -810,9 +818,11 @@ impl AppState {
                                 ratatui::style::Color::Red,
                             );
                         }
-                        self.announcement = Some(
-                            "The gate to the stairs is sealed! Step on the Pressure Plate or slay the Floor Guardian to unseal the ascent!".to_string(),
-                        );
+                        self.announcement = Some(if raid_floor {
+                            "Defeat the Gatekeeper to open the stairs.".to_string()
+                        } else {
+                            "The gate to the stairs is sealed! Step on the Pressure Plate or slay the Floor Guardian to unseal the ascent!".to_string()
+                        });
                     } else if is_shrine_locked {
                         if let Some((pos, _)) = player_info {
                             self.spawn_floating_text(

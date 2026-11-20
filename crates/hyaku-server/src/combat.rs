@@ -1,5 +1,5 @@
 use hyaku_protocol::{
-    Direction, EnemyKind, EnemyState, FloorMap, PlayerState, Position, ProjectileState, Tile,
+    BossPhase, Direction, EnemyKind, EnemyState, FloorMap, PlayerState, Position, ProjectileState, Tile,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -151,15 +151,20 @@ pub fn execute_directional_slash(
         }
     }
 
-    // 2. Check collisions with enemies in the sweep arc
+    let mut hit_gatekeeper = false;
     for tile in &arc_tiles {
         if !tile.pos.in_bounds(map_width, map_height) {
             continue;
         }
 
         for enemy in enemies.iter_mut() {
-            if enemy.is_alive() && enemy.pos == tile.pos {
-                hit_count += 1;
+            if enemy.is_alive() && enemy.occupies(tile.pos) {
+                if enemy.kind == EnemyKind::FloorBoss {
+                    if hit_gatekeeper {
+                        continue;
+                    }
+                    hit_gatekeeper = true;
+                }
 
                 // Critical roll: 25% chance
                 let roll = ((tick_counter.wrapping_mul(7919))
@@ -174,8 +179,13 @@ pub fn execute_directional_slash(
                     base_dmg
                 };
 
-                enemy.take_damage(dmg);
-                total_damage += dmg;
+                let dealt = enemy.take_damage(dmg);
+                let damage = if enemy.kind == EnemyKind::FloorBoss { dealt } else { dmg };
+                if damage == 0 {
+                    continue;
+                }
+                hit_count += 1;
+                total_damage += damage;
 
                 let enemy_name = enemy.kind.name();
                 if !enemy.is_alive() {
@@ -201,7 +211,7 @@ pub fn execute_directional_slash(
                 } else if is_crit {
                     announcements.push(format!(
                         ":: CRIT :: {}'s directional sweep struck {} for {} DMG!",
-                        player_name, enemy_name, dmg
+                        player_name, enemy_name, damage
                     ));
                 }
             }
@@ -280,12 +290,8 @@ pub fn process_continuous_tether_tick(
         if let Some((p2_pos, p2_name, is_other_player)) = target_info {
             let line_points = bresenham_line(p1_pos, p2_pos);
 
-            for (idx, &pt) in line_points.iter().enumerate() {
-                if pt == p1_pos || pt == p2_pos {
-                    continue;
-                }
-
-                // Electric spark particle along the beam (single-width '↯', '⠶', '*')
+            let interior = |pt: Position| pt != p1_pos && pt != p2_pos;
+            for (idx, &pt) in line_points.iter().enumerate().filter(|(_, pt)| interior(**pt)) {
                 let spark_glyph = match (tick_counter + idx as u64) % 3 {
                     0 => '↯',
                     1 => '⠶',
@@ -295,33 +301,42 @@ pub fn process_continuous_tether_tick(
                     ProjectileState::new(pt, spark_glyph, (120, 240, 255)),
                     1,
                 ));
+            }
 
-                // Deal continuous electric damage each tick to intersecting enemies
-                for enemy in enemies.iter_mut() {
-                    if enemy.is_alive() && enemy.pos == pt {
-                        enemy.take_damage(TETHER_DAMAGE_PER_TICK);
-                        total_tether_damage += TETHER_DAMAGE_PER_TICK;
-
-                        if !enemy.is_alive() {
-                            let dropped = if enemy.is_boss { 10 } else { 2 };
-                            *shards_earned.entry(p1_id.clone()).or_insert(0) += dropped;
-                            if is_other_player {
-                                *shards_earned.entry(p2_id.clone()).or_insert(0) += dropped;
-                            }
-
-                            // Drop Aether Shards (*) at death position
-                            spark_projectiles.push((
-                                ProjectileState::new(pt, '*', (255, 215, 0)),
-                                6,
-                            ));
-
-                            announcements.push(format!(
-                                ":: AETHERIC ELECTROCUTION :: @{} & {} vaporized {} with the Lightning Tether! (+{} Shards dropped)",
-                                p1_name, p2_name, enemy.kind.name(), dropped
-                            ));
-                        }
+            for enemy in enemies.iter_mut().filter(|e| e.is_alive()) {
+                let Some(pt) = line_points.iter().copied().find(|&pt| interior(pt) && enemy.occupies(pt)) else {
+                    continue;
+                };
+                if enemy.boss_phase == Some(BossPhase::Shielded) {
+                    if is_other_player {
+                        enemy.boss_phase = Some(BossPhase::Exposed);
+                        announcements.push("Gatekeeper shield broken.".to_string());
                     }
+                    continue;
                 }
+                let dealt = enemy.take_damage(TETHER_DAMAGE_PER_TICK);
+                total_tether_damage += if enemy.kind == EnemyKind::FloorBoss {
+                    dealt
+                } else {
+                    TETHER_DAMAGE_PER_TICK
+                };
+                if enemy.is_alive() {
+                    continue;
+                }
+
+                let dropped = if enemy.is_boss { 10 } else { 2 };
+                *shards_earned.entry(p1_id.clone()).or_insert(0) += dropped;
+                if is_other_player {
+                    *shards_earned.entry(p2_id.clone()).or_insert(0) += dropped;
+                }
+                spark_projectiles.push((
+                    ProjectileState::new(pt, '*', (255, 215, 0)),
+                    6,
+                ));
+                announcements.push(format!(
+                    ":: AETHERIC ELECTROCUTION :: @{} & {} vaporized {} with the Lightning Tether! (+{} Shards dropped)",
+                    p1_name, p2_name, enemy.kind.name(), dropped
+                ));
             }
         }
     }
@@ -361,8 +376,13 @@ pub fn update_enemy_ai(
     // (enemy_pos, target_pos, damage, attacker_name)
     let mut attacks: Vec<(Position, Position, i32, String)> = Vec::new();
 
+    let gatekeeper = enemies.iter().find(|e| e.kind == EnemyKind::FloorBoss && e.is_alive()).cloned();
+    let can_move = |pos| {
+        is_tile_walkable(map, tiles_override, pos)
+            && !gatekeeper.as_ref().is_some_and(|boss| boss.occupies(pos))
+    };
     for enemy in enemies.iter_mut() {
-        if !enemy.is_alive() {
+        if !enemy.is_alive() || enemy.kind == EnemyKind::FloorBoss {
             continue;
         }
 
@@ -402,7 +422,7 @@ pub fn update_enemy_ai(
                         EnemyKind::Archer => 10,
                         EnemyKind::Brute => 20,
                         EnemyKind::Phantom => 15,
-                        EnemyKind::FloorBoss => 28,
+                        EnemyKind::FloorBoss => continue,
                     };
                     attacks.push((enemy.pos, target, dmg, enemy.kind.name().to_string()));
                 } else if enemy.kind == EnemyKind::Archer && min_dist >= 2 && min_dist <= 5 {
@@ -430,7 +450,7 @@ pub fn update_enemy_ai(
                     // Step toward target
                     if let Some(step_dir) = enemy.pos.direction_to(target) {
                         let next_pos = enemy.pos.step(step_dir);
-                        if is_tile_walkable(map, tiles_override, next_pos) {
+                        if can_move(next_pos) {
                             enemy.pos = next_pos;
                         }
                     }
@@ -440,7 +460,7 @@ pub fn update_enemy_ai(
                 let mut rng = StdRng::seed_from_u64(tick_counter.wrapping_add(enemy.id as u64));
                 let random_dir = Direction::ALL[rng.gen_range(0..4)];
                 let next_pos = enemy.pos.step(random_dir);
-                if is_tile_walkable(map, tiles_override, next_pos) {
+                if can_move(next_pos) {
                     enemy.pos = next_pos;
                 }
             }

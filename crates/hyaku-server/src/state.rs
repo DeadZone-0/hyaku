@@ -1,3 +1,4 @@
+use crate::boss::BossRaid;
 use hyaku_protocol::{
     ClientPacket, DecoyState, Direction, EnemyKind, EnemyState, FloorCarving, FloorMap, PlayerState,
     ProjectileState, ServerPacket, TickState, Tile, Position,
@@ -19,6 +20,7 @@ pub fn sanitize_text(input: &str, max_chars: usize) -> String {
 
 pub struct FloorInstance {
     pub floor: u32,
+    raid: BossRaid,
     pub map: FloorMap,
     pub players: HashMap<String, PlayerState>,
     pub enemies: Vec<EnemyState>,
@@ -52,12 +54,15 @@ impl FloorInstance {
 
         let (shrine_goal, stairs_unlocked) = if floor == 1 {
             (0, true)
+        } else if floor % 10 == 0 {
+            (0, false)
         } else {
             (10 + (floor - 2) * 5, false)
         };
 
         Self {
             floor,
+            raid: BossRaid::default(),
             map: map.clone(),
             players: HashMap::new(),
             enemies,
@@ -104,6 +109,10 @@ impl FloorInstance {
             }
         }
 
+        if self.gatekeeper_alive() {
+            return announcements;
+        }
+
         // Group plates by gate_id
         let mut plates_by_gate: HashMap<u8, Vec<Position>> = HashMap::new();
         for &(gid, pos) in &self.map.plates {
@@ -147,6 +156,10 @@ impl FloorInstance {
         }
 
         announcements
+    }
+
+    fn gatekeeper_alive(&self) -> bool {
+        self.enemies.iter().any(|e| e.kind == EnemyKind::FloorBoss && e.is_alive())
     }
 
     pub fn get_effective_tile(&self, pos: Position) -> Option<Tile> {
@@ -197,7 +210,11 @@ impl FloorInstance {
             return (false, None);
         }
 
-        if !self.is_walkable(target_pos) {
+        if !self.is_walkable(target_pos)
+            || self.enemies.iter().any(|e| {
+                e.kind == EnemyKind::FloorBoss && e.is_alive() && e.occupies(target_pos)
+            })
+        {
             return (false, None);
         }
 
@@ -227,11 +244,18 @@ impl FloorInstance {
         crit_chance: u32,
         knockback_dir: Option<Direction>,
         attacker_name: &str,
+        hit_gatekeeper: &mut bool,
     ) -> Option<(i32, bool, u32, Vec<String>)> {
         let enemy_idx = self
             .enemies
             .iter()
-            .position(|e| e.is_alive() && e.pos == target_pos)?;
+            .position(|e| {
+                e.is_alive() && e.occupies(target_pos)
+                    && (e.kind != EnemyKind::FloorBoss || !*hit_gatekeeper)
+            })?;
+        if self.enemies[enemy_idx].kind == EnemyKind::FloorBoss {
+            *hit_gatekeeper = true;
+        }
 
         let enemy_id = self.enemies[enemy_idx].id;
         let enemy_name = self.enemies[enemy_idx].kind.name();
@@ -249,7 +273,15 @@ impl FloorInstance {
             base_dmg
         };
 
-        self.enemies[enemy_idx].take_damage(actual_dmg);
+        let dealt = self.enemies[enemy_idx].take_damage(actual_dmg);
+        let actual_dmg = if self.enemies[enemy_idx].kind == EnemyKind::FloorBoss {
+            dealt
+        } else {
+            actual_dmg
+        };
+        if actual_dmg == 0 {
+            return None;
+        }
 
         let particle_glyph = if is_crit { '!' } else { '*' };
         let particle_rgb = if is_crit {
@@ -298,11 +330,13 @@ impl FloorInstance {
                         let occupied = self
                             .enemies
                             .iter()
-                            .position(|e| e.is_alive() && e.pos == pushed_pos);
+                            .position(|e| e.is_alive() && e.occupies(pushed_pos));
                         if let Some(other_idx) = occupied {
                             extra_dmg += 5;
                             self.enemies[enemy_idx].take_damage(5);
-                            self.enemies[other_idx].take_damage(5);
+                            if self.enemies[other_idx].kind != EnemyKind::FloorBoss {
+                                self.enemies[other_idx].take_damage(5);
+                            }
                             events.push(format!(
                                 ":: FOE COLLISION :: {} crashed into another foe (+5 DMG)!",
                                 enemy_name
@@ -403,6 +437,15 @@ impl FloorInstance {
             4,
         );
 
+        if self.floor % 10 == 0 {
+            self.raid.step(
+                &mut self.enemies,
+                &mut self.players,
+                |pos| Self::resolve_tile(&self.map, &self.tiles_override, pos),
+                self.tick_counter,
+            );
+        }
+
         // 3. Process Co-op Lightning Tether Continuous Electric Damage (each tick)
         let tether_result = crate::combat::process_continuous_tether_tick(
             &mut self.players,
@@ -423,14 +466,15 @@ impl FloorInstance {
             }
         });
 
-        // Remove dead non-boss enemies and reward floor players
-        let prev_boss_alive = self.enemies.iter().any(|e| e.is_boss && e.is_alive());
+        let gatekeeper_defeated = self.enemies.iter().any(|e| {
+            e.kind == EnemyKind::FloorBoss && !e.is_alive()
+        });
         self.enemies.retain(|e| e.is_alive());
-        let boss_still_alive = self.enemies.iter().any(|e| e.is_boss && e.is_alive());
 
-        // If boss was defeated, open all gates
-        if prev_boss_alive && !boss_still_alive {
-            println!("[HYAKU BOSS] Floor {} boss has fallen! All barrier gates unlocked.", self.floor);
+        if gatekeeper_defeated {
+            self.raid = BossRaid::default();
+            self.stairs_unlocked = true;
+            self.pending_announcements.push("Gatekeeper down. Stairs open.".to_string());
             for &(gate_id, gate_pos) in &self.map.gates {
                 self.unlocked_gates.insert(gate_id);
                 self.tiles_override
@@ -443,7 +487,10 @@ impl FloorInstance {
             floor: self.floor,
             players: self.players.values().cloned().collect(),
             enemies: self.enemies.clone(),
-            projectiles: self.projectiles.iter().map(|(p, _)| p.clone()).collect(),
+            projectiles: self.projectiles.iter()
+                .map(|(p, _)| p.clone())
+                .chain(self.raid.effects())
+                .collect(),
             tiles_override: self.tiles_override.iter().map(|(&p, &t)| (p, t)).collect(),
             carvings: self.carvings.clone(),
             tower_shards_bank: tower_shards,
@@ -659,6 +706,7 @@ impl ServerState {
                                 }
 
                                 let mut shards_earned = 0;
+                                let mut hit_gatekeeper = false;
 
                                 match class_idx {
                                     // 0: Blade - Iai: Eightfold Bloom (all 8 surrounding tiles)
@@ -691,6 +739,7 @@ impl ServerState {
                                                 30,
                                                 k_dir,
                                                 &player_name,
+                                                &mut hit_gatekeeper,
                                             ) {
                                                 shards_earned += s;
                                                 announcements.extend(events);
@@ -720,6 +769,7 @@ impl ServerState {
                                                     35,
                                                     k_dir,
                                                     &player_name,
+                                                    &mut hit_gatekeeper,
                                                 ) {
                                                     floor.projectiles.push((
                                                         ProjectileState::new(target_pos, '*', (80, 220, 255)),
@@ -775,6 +825,7 @@ impl ServerState {
                                                     40,
                                                     Some(line_dir),
                                                     &player_name,
+                                                    &mut hit_gatekeeper,
                                                 ) {
                                                     shards_earned += s;
                                                     announcements.extend(events);
@@ -822,6 +873,7 @@ impl ServerState {
                                                     25,
                                                     Some(dir),
                                                     &player_name,
+                                                    &mut hit_gatekeeper,
                                                 ) {
                                                     shards_earned += s;
                                                     announcements.extend(events);
@@ -1005,7 +1057,9 @@ impl ServerState {
                                 pos.chebyshev_distance(sp) <= 3
                             }) || matches!(floor.get_effective_tile(pos), Some(Tile::Shrine));
 
-                            if !near_shrine {
+                            if floor.floor % 10 == 0 {
+                                direct_msg = Some("This shrine heals. It takes no shard offerings.".to_string());
+                            } else if !near_shrine {
                                 direct_msg = Some("You must stand near the Floor Shrine [百] to deposit shards!".to_string());
                             } else {
                                 let deposit = amount.min(shards);
@@ -1247,7 +1301,9 @@ impl ServerState {
                                     )
                                 });
 
-                                if is_gate_locked {
+                                if floor.gatekeeper_alive() {
+                                    rejection_msg = Some("Defeat the Gatekeeper to open the stairs.".to_string());
+                                } else if is_gate_locked {
                                     rejection_msg = Some(":: ASCENSION SEALED :: The gate to the stairs is locked! Unlock it via the Pressure Plate or by slaying the Floor Guardian!".to_string());
                                 } else if !floor.stairs_unlocked {
                                     rejection_msg = Some(format!(
@@ -1381,6 +1437,58 @@ mod tests {
     use tokio::sync::mpsc;
 
     #[test]
+    fn gatekeeper_shield_requires_a_live_ally_and_defeat_opens_stairs() {
+        use hyaku_protocol::BossPhase;
+
+        let mut floor = FloorInstance::new(10, 42);
+        floor.enemies.retain(|e| e.kind == EnemyKind::FloorBoss);
+        let center = floor.enemies[0].pos;
+        let west = Position::new(center.x - 3, center.y);
+        let east = Position::new(center.x + 3, center.y);
+        let plate = floor.map.plates[0].1;
+        let gate = floor.map.gates[0].1;
+        floor.add_player(PlayerState::new("alice".into(), "Alice".into(), 0, west, 10));
+        floor.add_player(PlayerState::new("bob".into(), "Bob".into(), 0, plate, 10));
+        floor.check_pressure_plates();
+        assert_eq!(floor.get_effective_tile(gate), Some(Tile::Gate { id: 1, open: false }));
+        assert!(!floor.stairs_unlocked);
+        assert!(!floor.move_player("alice", Direction::Right));
+
+        floor.enemies[0].boss_phase = Some(BossPhase::Shielded);
+        let hp = floor.enemies[0].hp;
+        let edge = west.step(Direction::Right);
+        assert!(floor.hit_enemy_at(edge, 50, 0, None, "Alice", &mut false).is_none());
+        floor.decoys.push(DecoyState::new(1, "Alice".into(), east, 30));
+        floor.players.get_mut("alice").unwrap().tether_target = Some("decoy-1".into());
+        assert_eq!(floor.step_tick(0).enemies[0].boss_phase, Some(BossPhase::Shielded));
+
+        let bob = floor.players.get_mut("bob").unwrap();
+        bob.pos = east;
+        bob.tether_target = Some("alice".into());
+        floor.players.get_mut("alice").unwrap().tether_target = Some("bob".into());
+        let tick = floor.step_tick(0);
+        assert_eq!(tick.enemies[0].boss_phase, Some(BossPhase::Exposed));
+        assert_eq!(tick.enemies[0].hp, hp);
+        assert_eq!(floor.step_tick(0).enemies[0].hp, hp - crate::combat::TETHER_DAMAGE_PER_TICK);
+
+        let mut hit_gatekeeper = false;
+        assert!(floor.hit_enemy_at(edge, 25, 0, None, "Alice", &mut hit_gatekeeper).is_some());
+        assert!(floor.hit_enemy_at(center, 25, 0, None, "Alice", &mut hit_gatekeeper).is_none());
+
+        floor.enemies[0].hp = 1;
+        let slash = crate::combat::execute_directional_slash(
+            west, "Alice", Direction::Right, 0, floor.map.width, floor.map.height,
+            &mut floor.enemies, floor.tick_counter,
+        );
+        assert_eq!(slash.hit_count, 1);
+        assert_eq!(slash.shards_dropped, 10);
+        let tick = floor.step_tick(0);
+        assert!(tick.enemies.is_empty());
+        assert!(tick.stairs_unlocked);
+        assert_eq!(floor.get_effective_tile(gate), Some(Tile::Gate { id: 1, open: true }));
+    }
+
+    #[test]
     fn test_floor_instance_movement_collision() {
         let mut floor = FloorInstance::new(1, 12345);
         let spawn = floor.map.spawn_pos;
@@ -1450,7 +1558,7 @@ mod tests {
         floor.enemies.push(enemy);
 
         // Knock enemy North into Chasm
-        let result = floor.hit_enemy_at(pos, 10, 0, Some(Direction::Up), "ZeHero");
+        let result = floor.hit_enemy_at(pos, 10, 0, Some(Direction::Up), "ZeHero", &mut false);
         assert!(result.is_some());
         let (_dmg, _crit, shards, events) = result.unwrap();
         assert_eq!(floor.enemies.iter().find(|e| e.id == 101).unwrap().hp, 0);

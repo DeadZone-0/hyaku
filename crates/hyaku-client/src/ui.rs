@@ -2,7 +2,7 @@ use crate::app::{
     AppState, InputMode, Screen, ServerBannerData, CLASS_PREVIEWS, DEATH_BANNER, DEATH_COLOR_ACCENT,
     DEATH_COLOR_PRIMARY, TITLE_BANNER, TITLE_COLOR_ACCENT, TITLE_COLOR_MUTED, TITLE_COLOR_PRIMARY,
 };
-use hyaku_protocol::{Direction, Position, Tile, PLAYER_CLASSES};
+use hyaku_protocol::{BossPhase, Direction, EnemyState, Position, Tile, PLAYER_CLASSES};
 use ratatui::{
     layout::{Alignment, Constraint, Direction as LayoutDirection, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -424,6 +424,16 @@ fn render_disconnected_screen(frame: &mut Frame, app: &AppState) {
 
 fn render_game_screen(frame: &mut Frame, app: &mut AppState) {
     let area = frame.area();
+    let boss = app.tick_state.as_ref().and_then(|tick| {
+        tick.enemies.iter().find(|e| e.is_alive() && e.boss_phase.is_some())
+    });
+    let boss_bar_height = if boss.is_none() {
+        0
+    } else if area.height < 16 {
+        1
+    } else {
+        3
+    };
 
     // 4-Pane TUI Command Deck:
     // 1. Top Status Bar: Height 3
@@ -433,12 +443,16 @@ fn render_game_screen(frame: &mut Frame, app: &mut AppState) {
         .direction(LayoutDirection::Vertical)
         .constraints([
             Constraint::Length(3), // 1. Top Status Bar
-            Constraint::Min(10),   // Middle Deck (72% Camera + 28% Sidebar)
+            Constraint::Length(boss_bar_height),
+            Constraint::Min(if boss.is_some() { 0 } else { 10 }),
             Constraint::Length(4), // 4. Bottom HUD
         ])
         .split(area);
 
     render_top_status_bar(frame, app, deck_layout[0]);
+    if let Some(boss) = boss {
+        render_boss_bar(frame, boss, deck_layout[1]);
+    }
 
     let middle_layout = Layout::default()
         .direction(LayoutDirection::Horizontal)
@@ -446,11 +460,11 @@ fn render_game_screen(frame: &mut Frame, app: &mut AppState) {
             Constraint::Percentage(72), // 2. Main Camera Viewport (Left 72%)
             Constraint::Percentage(28), // 3. Sidebar (Right 28%)
         ])
-        .split(deck_layout[1]);
+        .split(deck_layout[2]);
 
     render_camera_viewport(frame, app, middle_layout[0]);
     render_sidebar(frame, app, middle_layout[1]);
-    render_bottom_hud(frame, app, deck_layout[2]);
+    render_bottom_hud(frame, app, deck_layout[3]);
 
     // Slain adventurer overlay
     if app.my_player().map_or(false, |p| !p.is_alive()) {
@@ -460,6 +474,31 @@ fn render_game_screen(frame: &mut Frame, app: &mut AppState) {
     // Full-width ServerBanner popup overlay across all connected terminals
     if let Some(ref banner) = app.server_banner {
         render_server_banner(frame, banner, area);
+    }
+}
+
+fn render_boss_bar(frame: &mut Frame, boss: &EnemyState, area: Rect) {
+    let (phase, color) = match boss.boss_phase {
+        Some(BossPhase::Barrage) => ("BARRAGE", Color::LightRed),
+        Some(BossPhase::Tremor) => ("TREMOR", Color::LightRed),
+        Some(BossPhase::Shielded) => ("SHIELD [Q] TETHER ACROSS", Color::Cyan),
+        Some(BossPhase::Exposed) => ("SHIELD DOWN", Color::LightRed),
+        None => return,
+    };
+    let title = format!(" GATEKEEPER / {phase} ");
+    let hp = format!("{} / {}", boss.hp, boss.max_hp);
+    let gauge = Gauge::default()
+        .gauge_style(Style::default().fg(color).bg(Color::Rgb(39, 29, 38)))
+        .ratio((f64::from(boss.hp) / f64::from(boss.max_hp.max(1))).clamp(0.0, 1.0));
+    if area.height >= 3 {
+        frame.render_widget(
+            gauge.block(Block::bordered().title(title).border_style(Style::default().fg(color)))
+                .label(hp),
+            area,
+        );
+    } else {
+        let label = format!("GATEKEEPER {phase} {}/{}", boss.hp, boss.max_hp);
+        frame.render_widget(gauge.label(label), area);
     }
 }
 
@@ -486,7 +525,7 @@ fn render_top_status_bar(frame: &mut Frame, app: &AppState, area: Rect) {
     };
 
     let shard_ratio = if shrine_goal == 0 {
-        1.0
+        if stairs_unlocked { 1.0 } else { 0.0 }
     } else {
         (shrine_cur as f64 / shrine_goal as f64).clamp(0.0, 1.0)
     };
@@ -597,7 +636,9 @@ fn render_top_status_bar(frame: &mut Frame, app: &AppState, area: Rect) {
     frame.render_widget(Paragraph::new(floor_line), cols[0]);
 
     // Middle: Shrine [百] Shard Progress Gauge
-    let gauge_label = if shrine_goal == 0 || stairs_unlocked {
+    let gauge_label = if app.current_floor % 10 == 0 && shrine_goal == 0 {
+        if stairs_unlocked { "Raid cleared".to_string() } else { "Stairs sealed".to_string() }
+    } else if shrine_goal == 0 || stairs_unlocked {
         format!("Shrine [百]: UNLOCKED ({}/{} Shards)", shrine_cur, shrine_goal)
     } else {
         format!("Shrine [百]: {}/{} [{} {}m] (Bank: {})", shrine_cur, shrine_goal, shrine_compass, shrine_dist, tower_bank)
@@ -922,7 +963,8 @@ fn render_camera_viewport(frame: &mut Frame, app: &mut AppState, area: Rect) {
 
         // 4. Render projectiles (directional melee slash arcs, arrows, aether shards, ether bolts)
         // Sort so slash arcs ('╱', '─', '│', '╲') render with priority over ground shard particles
-        let mut sorted_projs: Vec<_> = tick.projectiles.iter().collect();
+        let danger = |glyph| matches!(glyph, '░' | '▒' | '▓' | '█');
+        let mut sorted_projs: Vec<_> = tick.projectiles.iter().filter(|p| !danger(p.glyph)).collect();
         sorted_projs.sort_by_key(|p| match p.glyph {
             '╱' | '│' | '╲' | '─' => 1,
             _ => 0,
@@ -1008,6 +1050,20 @@ fn render_camera_viewport(frame: &mut Frame, app: &mut AppState, area: Rect) {
                 continue;
             }
             let (sx, sy) = app.world_to_screen(enemy.pos);
+            if let Some(phase) = enemy.boss_phase {
+                let color = if phase == BossPhase::Shielded { Color::Cyan } else { Color::LightRed };
+                let style = Style::default().fg(color).bg(Color::Rgb(38, 24, 33)).add_modifier(Modifier::BOLD);
+                for (row, line) in [r"/^^^\", "|o#o|", r"\_V_/"].iter().enumerate() {
+                    let y = sy + row as i32 - 1;
+                    for (col, glyph) in line.chars().enumerate() {
+                        let x = sx + col as i32 - 2;
+                        if (0..inner_w).contains(&x) && (0..inner_h).contains(&y) {
+                            grid[y as usize][x as usize] = (glyph, style);
+                        }
+                    }
+                }
+                continue;
+            }
             if sx >= 0 && sx < inner_w && sy >= 0 && sy < inner_h {
                 let hp_ratio = enemy.hp as f32 / enemy.max_hp.max(1) as f32;
                 let rgb = enemy.kind.color_rgb();
@@ -1212,7 +1268,7 @@ fn render_camera_viewport(frame: &mut Frame, app: &mut AppState, area: Rect) {
             let (tx, ty) = app.world_to_screen(target_pos);
             if tx >= 0 && tx < inner_w && ty >= 0 && ty < inner_h {
                 let (cur_ch, cur_style) = grid[ty as usize][tx as usize];
-                let has_enemy = tick.enemies.iter().any(|e| e.is_alive() && e.pos == target_pos);
+                let has_enemy = tick.enemies.iter().any(|e| e.is_alive() && e.occupies(target_pos));
 
                 if has_enemy {
                     grid[ty as usize][tx as usize] = (
@@ -1255,6 +1311,18 @@ fn render_camera_viewport(frame: &mut Frame, app: &mut AppState, area: Rect) {
                                 .add_modifier(Modifier::BOLD),
                         );
                     }
+                }
+            }
+        }
+        for warning in tick.projectiles.iter().filter(|p| danger(p.glyph)) {
+            let (x, y) = app.world_to_screen(warning.pos);
+            if (0..inner_w).contains(&x) && (0..inner_h).contains(&y) {
+                let cell = &mut grid[y as usize][x as usize];
+                let (r, g, b) = warning.color_rgb;
+                if tick.players.iter().any(|p| p.pos == warning.pos) {
+                    cell.1 = cell.1.fg(Color::White).bg(Color::Rgb(r / 2, g / 4, b / 4));
+                } else {
+                    *cell = (warning.glyph, Style::default().fg(Color::Rgb(r, g, b)).bg(Color::Rgb(48, 20, 22)));
                 }
             }
         }
@@ -2101,4 +2169,52 @@ fn render_server_banner(frame: &mut Frame, banner: &ServerBannerData, area: Rect
 
     let p = Paragraph::new(text).alignment(Alignment::Center);
     frame.render_widget(p, inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyaku_protocol::{EnemyKind, FloorMap, PlayerState, ProjectileState, TickState};
+    use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn raid_screen_draws_the_shield_cue_sprite_and_warning() {
+        let map = FloorMap::generate(42, 10);
+        let mut boss = map.initial_enemies.iter().find(|e| e.kind == EnemyKind::FloorBoss)
+            .unwrap().clone();
+        boss.boss_phase = Some(BossPhase::Shielded);
+        let pos = Position::new(boss.pos.x, boss.pos.y + 4);
+        let warning = Position::new(pos.x + 4, pos.y);
+        let mut app = AppState::new("Alice".into(), "ws://localhost".into(), 0);
+        app.current_floor = 10;
+        app.current_map = Some(map);
+        app.my_player_id = Some("p1".into());
+        app.tick_state = Some(TickState {
+            tick: 1,
+            floor: 10,
+            players: vec![PlayerState::new("p1".into(), "Alice".into(), 0, pos, 10)],
+            enemies: vec![boss],
+            projectiles: vec![ProjectileState::new(warning, '▓', (255, 101, 66))],
+            tiles_override: Vec::new(),
+            carvings: Vec::new(),
+            tower_shards_bank: 0,
+            decoys: Vec::new(),
+            shrine_shards: 0,
+            shrine_goal: 0,
+            stairs_unlocked: false,
+        });
+
+        for (width, height) in [(80, 24), (48, 14)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| render_game_screen(frame, &mut app)).unwrap();
+            let screen: String = terminal.backend().buffer().content().iter().map(|cell| cell.symbol()).collect();
+            assert!(screen.contains("SHIELD [Q] TETHER ACROSS"), "{screen}");
+            if height == 24 {
+                assert!(screen.contains("|o#o|"), "{screen}");
+                assert!(screen.contains('▓'), "{screen}");
+            } else {
+                assert!(screen.contains("2100/2100"), "{screen}");
+            }
+        }
+    }
 }

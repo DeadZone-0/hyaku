@@ -141,7 +141,7 @@ impl EnemyKind {
             EnemyKind::Archer => "Abyssal Archer",
             EnemyKind::Brute => "Tower Brute",
             EnemyKind::Phantom => "Wandering Phantom",
-            EnemyKind::FloorBoss => "Floor Sentinel Boss",
+            EnemyKind::FloorBoss => "Gatekeeper",
         }
     }
 
@@ -176,6 +176,14 @@ impl EnemyKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BossPhase {
+    Barrage,
+    Tremor,
+    Shielded,
+    Exposed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnemyState {
     pub id: u32,
@@ -185,6 +193,8 @@ pub struct EnemyState {
     pub max_hp: i32,
     pub glyph: char,
     pub is_boss: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boss_phase: Option<BossPhase>,
 }
 
 impl EnemyState {
@@ -199,6 +209,7 @@ impl EnemyState {
             max_hp: base_hp,
             glyph: kind.default_glyph(),
             is_boss,
+            boss_phase: is_boss.then_some(BossPhase::Barrage),
         }
     }
 
@@ -206,8 +217,25 @@ impl EnemyState {
         self.hp > 0
     }
 
-    pub fn take_damage(&mut self, amount: i32) {
-        self.hp = (self.hp - amount).max(0);
+    pub fn occupies(&self, pos: Position) -> bool {
+        if self.kind == EnemyKind::FloorBoss {
+            self.pos.x.abs_diff(pos.x) <= 2 && self.pos.y.abs_diff(pos.y) <= 1
+        } else {
+            self.pos == pos
+        }
+    }
+
+    pub fn take_damage(&mut self, amount: i32) -> i32 {
+        // A burst of damage can't skip the next raid phase.
+        let min_hp = match self.boss_phase {
+            Some(BossPhase::Barrage) => self.max_hp * 2 / 3,
+            Some(BossPhase::Tremor) => self.max_hp / 3,
+            Some(BossPhase::Shielded) => return 0,
+            _ => 0,
+        };
+        let before = self.hp;
+        self.hp = (self.hp - amount).max(min_hp.min(before));
+        before - self.hp
     }
 }
 

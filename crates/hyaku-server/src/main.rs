@@ -1,3 +1,4 @@
+mod boss;
 pub mod combat;
 mod state;
 mod tick;

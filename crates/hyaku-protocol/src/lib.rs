@@ -8,7 +8,7 @@ pub mod tile;
 
 pub use direction::Direction;
 pub use entity::{
-    get_class_preset, DecoyState, EnemyKind, EnemyState, FloorCarving, PlayerClassPreset, PlayerState,
+    get_class_preset, BossPhase, DecoyState, EnemyKind, EnemyState, FloorCarving, PlayerClassPreset, PlayerState,
     ProjectileState, PLAYER_CLASSES,
 };
 pub use map::{FloorMap, Rect};
@@ -200,7 +200,7 @@ mod tests {
 
     #[test]
     fn test_circular_boss_arena_every_10th_floor() {
-        for floor in [10, 20, 50, 100] {
+        for floor in (10..=100).step_by(10) {
             let map = FloorMap::generate(777, floor);
             assert_eq!(map.floor, floor);
             assert!(map.is_walkable(map.spawn_pos));
@@ -210,7 +210,9 @@ mod tests {
             // Floor boss must be present
             let boss = map.initial_enemies.iter().find(|e| e.is_boss);
             assert!(boss.is_some(), "Floor {} must feature an elite FloorBoss", floor);
-            assert_eq!(boss.unwrap().kind, EnemyKind::FloorBoss);
+            let boss = boss.unwrap();
+            assert_eq!(boss.kind, EnemyKind::FloorBoss);
+            assert_eq!(boss.boss_phase, Some(BossPhase::Barrage));
 
             // Minions must be present
             assert!(map.initial_enemies.len() >= 4, "Floor {} must have minion escorts", floor);
