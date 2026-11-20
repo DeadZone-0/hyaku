@@ -117,4 +117,4 @@ So its been a very very fun project as i dont have much experience with multipla
 
 ## Ai usage 
 
-Not much i have basically used it in audio handling for MacOS as i dont have a mac and i dont know how it works also refined the map generation in the end , installer is made by ai , and the flowchart in readme , just remembered i have also used it to fix latency issue ... (i have modified them after anyways)
+Not much i have basically used it in audio handling for MacOS as i dont have a mac and i dont know how it works also refined the map generation in the end , installer is made by ai , and the flowchart in readme ( they r weird indeed ), just remembered i have also used it to fix latency issue ... (i have modified them after anyways)
