@@ -4,7 +4,7 @@ use crate::ui::{BurstKind, ParticleField, ENDING_DURATION, RESPAWN_OVERLAY};
 use crossterm::event::KeyCode;
 use hyaku_protocol::{
     basic_attack_tiles, get_class_preset, tether_range, ClientPacket, Direction, FloorCarving, FloorMap, HallOfFame, PlayerState, Position,
-    ProjectileState, ServerPacket, SlashTile, TickState, PLAYER_CLASSES,
+    ProjectileState, ServerPacket, SlashTile, TickState, Tile, PLAYER_CLASSES,
 };
 use ratatui::style::Color;
 use std::collections::HashMap;
@@ -95,6 +95,8 @@ pub struct AppState {
     pub ending_started: Option<Instant>,
     pub prologue: Option<Prologue>,
     pub respawned_at: Option<Instant>,
+    pub floor_entered_at: Option<Instant>,
+    pub hud_glow_at: Option<Instant>,
     pub particles: ParticleField,
     pub lore_floor: u32,
     pub world_seed: u64,
@@ -138,6 +140,8 @@ impl AppState {
             ending_started: None,
             prologue: None,
             respawned_at: None,
+            floor_entered_at: None,
+            hud_glow_at: None,
             particles: ParticleField::default(),
             lore_floor: 1,
             world_seed: 0,
@@ -965,6 +969,8 @@ impl AppState {
                 skip_prologue,
             } => {
                 self.my_player_id = Some(player_id);
+                self.floor_entered_at = Some(Instant::now());
+                self.hud_glow_at = None;
                 self.current_floor = floor;
                 self.world_seed = map_seed;
                 self.current_map = Some(FloorMap::generate(map_seed, floor));
@@ -990,6 +996,8 @@ impl AppState {
             }
             ServerPacket::Tick(mut state) => {
                 if self.current_floor != state.floor {
+                    self.floor_entered_at = Some(Instant::now());
+                    self.hud_glow_at = None;
                     self.particles.clear();
                     self.respawned_at = None;
                     self.current_floor = state.floor;
@@ -1062,12 +1070,18 @@ impl AppState {
                     }
 
                     if old_tick.floor == state.floor {
+                        if state.tiles_override.iter().any(|entry| {
+                            entry.1 == Tile::Campfire && !old_tick.tiles_override.contains(entry)
+                        }) {
+                            self.hud_glow_at = Some(Instant::now());
+                        }
                         if state.shrine_goal > 0
                             && old_tick.shrine_shards < state.shrine_goal
                             && state.shrine_shards >= state.shrine_goal
                             && state.stairs_unlocked
                             && !old_tick.stairs_unlocked
                         {
+                            self.hud_glow_at = Some(Instant::now());
                             self.milestone_cues.push(Cue::Shrine);
                             if let Some(pos) = self.current_map.as_ref().and_then(|map| map.shrine_pos) {
                                 self.particles.emit(pos, BurstKind::Shrine);
@@ -1129,6 +1143,10 @@ impl AppState {
             } => {
                 if floor > self.current_floor {
                     self.milestone_cues.push(Cue::Ascend);
+                }
+                if floor != self.current_floor {
+                    self.floor_entered_at = Some(Instant::now());
+                    self.hud_glow_at = None;
                 }
                 self.particles.clear();
                 self.respawned_at = None;

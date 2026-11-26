@@ -307,6 +307,9 @@ fn render_title_screen(frame: &mut Frame, app: &AppState) {
         .add_modifier(Modifier::BOLD);
     let stone = Color::Rgb(148, 143, 129);
     frame.render_widget(Block::default().style(Style::default().bg(DUSK)), area);
+    if area.width >= 48 && area.height >= 16 {
+        render_title_trim(frame, area, menu);
+    }
 
     let wordmark = [
         r"|   | \   /  /-\  |  / |   |",
@@ -395,6 +398,78 @@ fn render_title_screen(frame: &mut Frame, app: &AppState) {
         ["[Enter] Climb  [Q/Esc] Quit", "[A/D or arrows] Class"]
     };
     frame.render_widget(Paragraph::new(controls.join("\n")).centered(), chunks[3]);
+}
+
+fn render_title_trim(frame: &mut Frame, area: Rect, menu: Rect) {
+    let left = area.x;
+    let right = area.right() - 1;
+    let top = area.y;
+    let bottom = area.bottom() - 1;
+    let iron = Style::default().fg(Color::Rgb(53, 47, 47));
+    let bronze = Style::default().fg(Color::Rgb(127, 99, 73));
+    let gold = Style::default().fg(BRASS);
+    let tick = frame.count();
+    let buf = frame.buffer_mut();
+
+    for x in left + 1..right {
+        buf.set_string(x, top, "─", iron);
+        buf.set_string(x, bottom, "─", iron);
+    }
+    for y in top + 1..bottom {
+        buf.set_string(left, y, "│", iron);
+        buf.set_string(right, y, "│", iron);
+    }
+
+    buf.set_string(left, top, "╔═╦═╤═╾─◇─╴", bronze);
+    buf.set_string(right - 10, top, "╶─◇─╼═╤═╦═╗", bronze);
+    buf.set_string(left, bottom, "╚═╩═╧═╾─◇─╴", bronze);
+    buf.set_string(right - 10, bottom, "╶─◇─╼═╧═╩═╝", bronze);
+    let center = left + (area.width - 9) / 2;
+    buf.set_string(center, top, "─╼◇·◆·◇╾─", bronze);
+    buf.set_string(center, bottom, "─╼◇·◆·◇╾─", bronze);
+
+    for (edge, inward, room, offset) in [
+        (left, 1, menu.x - left, 0),
+        (right, -1, area.right() - menu.right(), 4),
+    ] {
+        let x = |distance: i16| (i32::from(edge) + i32::from(inward * distance)) as u16;
+        let glint = (tick / 6 + offset) % 28;
+        if glint < 9 {
+            buf.set_string(x(1 + glint as i16), top, "─", gold);
+        }
+        for y in [top + 1, top + 2, bottom - 1] {
+            buf.set_string(edge, y, "║", bronze);
+        }
+
+        let flame = ["✦", "♦", "✧", "♦", "✦", "♦"][(tick / 8 + offset) % 6];
+        let ember = Style::default().fg(Color::Rgb(218, 126, 67));
+        let fire_x = if room >= 6 { x(3) } else { edge };
+        buf.set_string(fire_x, bottom - 3, flame, ember);
+        buf.set_string(fire_x, bottom - 2, "╨", bronze);
+        for delay in [0, 5] {
+            let age = (tick / 5 + offset + delay) % 12;
+            if age < 7 {
+                let drift = if room >= 6 { [0, 1, 0, -1][age % 4] } else { 0 };
+                let spark_x = (i32::from(fire_x) + drift) as u16;
+                let color = Color::Rgb(193 - age as u8 * 16, 105 - age as u8 * 7, 54);
+                buf.set_string(spark_x, bottom - 4 - age as u16, "·", Style::default().fg(color));
+            }
+        }
+
+        if room >= 6 {
+            let sway = [0, 1, 1, 0, -1, -1][(tick / 18 + offset) % 6];
+            let chain = match sway * inward {
+                -1 => "╱",
+                1 => "╲",
+                _ => "│",
+            };
+            buf.set_string(x(2), top + 1, "│", bronze);
+            buf.set_string(x(2), top + 2, chain, bronze);
+            buf.set_string(x(2 + sway) - 1, top + 3, "[◇]", bronze);
+            buf.set_string(x(2 + sway), top + 3, flame, ember);
+            buf.set_string(fire_x - 2, bottom - 2, "╲_╨_╱", bronze);
+        }
+    }
 }
 
 fn render_title_keep(frame: &mut Frame, area: Rect, stone: Color) {
@@ -511,7 +586,7 @@ fn render_disconnected_screen(frame: &mut Frame, app: &AppState) {
 fn render_game_screen(frame: &mut Frame, app: &mut AppState) {
     let area = frame.area();
     frame.render_widget(Block::default().style(Style::default().bg(DUSK)), area);
-    let boss = app.tick_state.as_ref().and_then(|tick| {
+    let boss = app.tick_state.as_ref().filter(|tick| tick.floor == app.current_floor).and_then(|tick| {
         tick.enemies.iter().find(|e| e.is_alive() && e.boss_phase.is_some())
     });
     let boss_bar_height = if boss.is_none() {
@@ -538,7 +613,7 @@ fn render_game_screen(frame: &mut Frame, app: &mut AppState) {
 
     render_top_status_bar(frame, app, deck_layout[0]);
     if let Some(boss) = boss {
-        render_boss_bar(frame, boss, app.class_idx == RANGER_CLASS, deck_layout[1]);
+        render_boss_bar(frame, boss, app.class_idx == RANGER_CLASS, app.floor_entered_at, deck_layout[1]);
     }
 
     let middle_layout = Layout::default()
@@ -640,7 +715,7 @@ fn render_lore(frame: &mut Frame, app: &AppState, area: Rect) {
     frame.render_widget(Paragraph::new(keys).centered().style(Style::default().fg(BRASS)), footer);
 }
 
-fn render_boss_bar(frame: &mut Frame, boss: &EnemyState, ranged: bool, area: Rect) {
+fn render_boss_bar(frame: &mut Frame, boss: &EnemyState, ranged: bool, entered_at: Option<Instant>, area: Rect) {
     use RaidBoss::*;
 
     let raid_boss = boss.raid_boss.unwrap_or(AshWarden);
@@ -679,9 +754,35 @@ fn render_boss_bar(frame: &mut Frame, boss: &EnemyState, ranged: bool, area: Rec
         .gauge_style(Style::default().fg(color).bg(Color::Rgb(39, 29, 38)))
         .ratio((f64::from(boss.hp) / f64::from(boss.max_hp.max(1))).clamp(0.0, 1.0));
     if area.height >= 3 {
+        let reveal = entered_at.map(|at| at.elapsed().as_millis()).filter(|&age| {
+            age < 1800 && usize::from(area.width) >= title.len() + 14
+        });
+        let title = if let Some(age) = reveal {
+            let sigil = match raid_boss {
+                AshWarden => "△",
+                BellKeeper => "Ω",
+                MireMatron => "≈",
+                ChainKnight => "∞",
+                GlassRegent => "◇",
+                HollowHuntsman => "»",
+                LanternSaint => "✦",
+                FrostReaver => "✧",
+                CinderColossus => "▲",
+                AshSovereign => "♜",
+            };
+            let (left, right) = [("·", "·"), ("─·", "·─"), ("╼─·", "·─╾")][(age / 180).min(2) as usize];
+            let crest = Style::default().fg(raid_boss_color(raid_boss));
+            Line::from(vec![
+                Span::styled(format!(" {left} {sigil}"), crest),
+                Span::raw(title),
+                Span::styled(format!("{sigil} {right} "), crest),
+            ]).centered()
+        } else {
+            Line::raw(title)
+        };
+        let border = Block::bordered().border_style(Style::default().fg(color)).title(title);
         frame.render_widget(
-            gauge.block(Block::bordered().title(title).border_style(Style::default().fg(color)))
-                .label(hp),
+            gauge.block(border).label(hp),
             area,
         );
     } else {
@@ -804,6 +905,18 @@ fn render_top_status_bar(frame: &mut Frame, app: &AppState, area: Rect) {
     if inner.width == 0 || inner.height == 0 {
         return;
     }
+    if let Some(age) = app.hud_glow_at.map(|at| at.elapsed().as_millis()).filter(|age| *age < 900) {
+        let center = i32::from(area.x + area.width / 2);
+        let wave = (age as i32 * i32::from(area.width) / 1800).max(1);
+        let buffer = frame.buffer_mut();
+        for x in inner.x..inner.right() {
+            let distance = ((i32::from(x) - center).abs() - wave).abs();
+            if distance <= 3 {
+                let glow = if distance <= 1 { BRASS } else { Color::Rgb(178, 111, 63) };
+                buffer.set_string(x, area.y, "─", Style::default().fg(glow));
+            }
+        }
+    }
 
     let cols = Layout::default()
         .direction(LayoutDirection::Horizontal)
@@ -817,7 +930,7 @@ fn render_top_status_bar(frame: &mut Frame, app: &AppState, area: Rect) {
     // Left: Floor & Stratum Name
     let floor_line = Line::from(vec![
         Span::styled(
-            " HYAKU (百) ",
+            " ◇ ",
             Style::default()
                 .fg(palette.accent_color)
                 .add_modifier(Modifier::BOLD),
